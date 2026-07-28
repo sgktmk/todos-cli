@@ -31,9 +31,12 @@ HELP_ITEMS = [
     ("x", "やらない"),
     ("m", "移動"),
     ("i", "編集"),
+    ("D", "期日"),
+    ("T", "タグ"),
     ("I", "詳細文"),
+    ("o", "子タスク"),
     ("/", "検索"),
-    ("t", "タグ"),
+    ("t", "タグ検索"),
     ("r", "再配置"),
     ("A", "整理"),
     ("w", "警告"),
@@ -76,9 +79,12 @@ HELP_KEYS = [
     ("Enter", "タスクの詳細を表示"),
     ("", ""),
     ("a", "タスクを追加"),
+    ("o", "選択中のタスクの子として追加"),
     ("i", "タイトルを簡易編集"),
     ("I", "詳細文を編集（外部エディタ）"),
-    ("s", "ステータスを変更"),
+    ("D", "期日を設定・削除（空欄で削除）"),
+    ("T", "タグを編集（空白区切り・空欄で削除）"),
+    ("s", "ステータスを変更（相手は空欄で削除）"),
     ("d", "完了にする"),
     ("x", "やらないにする"),
     ("m", "セクションを移動"),
@@ -90,7 +96,7 @@ HELP_KEYS = [
     ("", ""),
     ("r", "自動再配置 (rollover)"),
     ("A", "アーカイブ"),
-    ("w", "構文上の警告を表示"),
+    ("w", "構文上の警告を表示・修正"),
     ("R", "ファイルを読み直す"),
     ("q", "終了"),
 ]
@@ -262,10 +268,16 @@ class App:
             self.show_detail()
         elif key == "a":
             self.add_task()
+        elif key == "o":
+            self.add_child()
         elif key == "i":
             self.rename_task()
         elif key == "I":
             self.edit_detail()
+        elif key == "D":
+            self.edit_due()
+        elif key == "T":
+            self.edit_tags()
         elif key == "s":
             self.change_status()
         elif key == "d":
@@ -338,6 +350,20 @@ class App:
         self.jump_to(task)
         self.notify("追加しました: %s (%s)" % (task.title, task.section))
 
+    def add_child(self):
+        """選択中のタスクの子として追加する（a はトップレベルに追加する）。"""
+        parent = self.current_task()
+        if parent is None:
+            return
+        title = self.prompt("「%s」の子タスク" % truncate(parent.title, 20), "")
+        if not title:
+            return
+        child = ops.add(self.doc, title, self.ctx.base, parent=parent)
+        self.save()
+        self.filter = None
+        self.jump_to(child)
+        self.notify("「%s」の子として追加しました。" % parent.title)
+
     def rename_task(self):
         task = self.current_task()
         if task is None:
@@ -360,6 +386,64 @@ class App:
         else:
             self.notify("変更はありません。")
 
+    def edit_due(self):
+        """期日を設定・変更・削除する。空欄で確定すると削除。"""
+        task = self.current_task()
+        if task is None:
+            return
+        text = self.prompt("期日（空で削除）",
+                           util.format_date(task.due) if task.due else "")
+        if text is None:
+            return
+        text = text.strip()
+        if text:
+            due = util.parse_date(text, self.ctx.base)
+            if due is None:
+                raise TodosError(
+                    "期日として解釈できません: %s（例: 2026/07/31、7/31、7月31日）" % text
+                )
+            ops.set_due(task, due)
+            message = "期日を %s にしました。" % util.format_date(due)
+        else:
+            ops.set_due(task, None)
+            message = "期日を削除しました。"
+        moved = self._follow_rule(task)
+        self.save()
+        if moved:
+            self.filter = None
+            self.jump_to(task)
+            message += " ルールに従って %s へ移しました。" % moved
+        self.notify(message)
+
+    def edit_tags(self):
+        """タグを差し替える。空白区切りで入力し、空欄で確定すると削除。"""
+        task = self.current_task()
+        if task is None:
+            return
+        text = self.prompt("タグ（空白区切り・空で削除）", " ".join(task.tags))
+        if text is None:
+            return
+        ops.set_tags(task, text.split())
+        self.save()
+        if task.tags:
+            self.notify("タグを %s にしました。" % " ".join("#" + t for t in task.tags))
+        else:
+            self.notify("タグを削除しました。")
+
+    def _follow_rule(self, task):
+        """期日を変えた結果ルールと食い違うなら配置を追従させ、移動先を返す。
+
+        放置すると次回起動で再配置を提案されるため、その場で合わせる。
+        子タスクは単独で移動できないので親の配置に従う。
+        """
+        if task.parent is not None:
+            return None
+        want = schedule.desired_section(task, self.ctx.base)
+        if want is None or want == task.section:
+            return None
+        schedule.move(self.doc, task, want)
+        return want
+
     def change_status(self):
         task = self.current_task()
         if task is None:
@@ -375,10 +459,11 @@ class App:
             return
         who = None
         if status in model.COUNTERPART_STATUSES:
-            who = self.prompt("相手（任意）", task.counterpart or "")
+            who = self.prompt("相手（任意・空で削除）", task.counterpart or "")
             if who is None:
                 return
-        ops.set_status(task, status, who or None)
+        # who を or None で潰すと空欄が「変更しない」になり、相手を消せなくなる。
+        ops.set_status(task, status, who)
         self.save()
         self.notify("ステータスを【%s】にしました。" % task.status_label())
 
@@ -527,7 +612,25 @@ class App:
         lines = []
         for issue in found:
             lines.append([("  ! ", "popup.warn"), (issue.format().strip(), "popup.text")])
-        self.popup("構文上の警告 (%d 件)" % len(found), lines)
+        title = "構文上の警告 (%d 件)" % len(found)
+        repairable = validate.fixable(found)
+        if not repairable:
+            self.popup(title, lines)
+            return
+        # 直せる問題は、何をするかを見せたうえでその場で直せるようにする。
+        lines.append("")
+        lines.append([("  修正内容", "popup.label")])
+        for issue in repairable:
+            lines.append([("    ", None), (issue.fix_label, "popup.text")])
+        if not self.popup_ask(
+            title, lines,
+            "y で %d 件を修正   他のキーで閉じる   j/k スクロール" % len(repairable),
+        ):
+            return
+        applied = [i for i in repairable if validate.apply_fix(self.doc, i)]
+        if applied:
+            self.save()
+        self.notify("%d 件を修正しました。" % len(applied))
 
     def show_help(self):
         lines = []

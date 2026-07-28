@@ -116,6 +116,20 @@ def set_detail(task: Task, detail: str | None) -> None:
     task.detail = detail.rstrip("\n").split("\n") if detail else []
 
 
+def set_tags(task: Task, tags: list[str]) -> None:
+    """タグを差し替える。重複は取り除き、書き戻せない文字は拒否する。"""
+    cleaned: list[str] = []
+    for tag in tags:
+        tag = tag.lstrip("#").strip()
+        if not tag:
+            continue
+        if "#" in tag or any(c.isspace() for c in tag):
+            raise TodosError("タグに空白と # は使えません: %s" % tag)
+        if tag not in cleaned:
+            cleaned.append(tag)
+    task.tags = cleaned
+
+
 def add_tags(task: Task, tags: list[str]) -> None:
     for tag in tags:
         tag = tag.lstrip("#").strip()
