@@ -15,7 +15,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from todos import cli, editor, model, ops, parser, render, schedule, store, util, validate  # noqa: E402
+from todos import (  # noqa: E402
+    cli, editor, model, ops, parser, render, schedule, store, tui, util, validate,
+)
 from todos import issues as iss  # noqa: E402
 
 TUE = dt.date(2026, 7, 28)  # 火曜日。当週の日曜は 2026/08/02
@@ -585,6 +587,113 @@ class EditorTest(unittest.TestCase):
         with self.assertRaises(util.TodosError):
             editor.edit_task(doc, task)
         self.assertEqual([t.title for t in doc.top_tasks()], ["消さない"])
+
+
+class TuiNavigationTest(unittest.TestCase):
+    """curses を起動せずに TUI の移動ロジックだけを検証する。"""
+
+    def make_app(self, doc):
+        app = tui.App.__new__(tui.App)
+        app.ctx = type("Ctx", (), {"doc": doc})()
+        app.section_idx = 0
+        app.task_idx = 0
+        app.scroll = 0
+        app.focus = "tasks"
+        app.filter = None
+        app.message = ""
+        return app
+
+    def doc_with_task_in(self, section_name):
+        doc = parser.parse_text("", base=TUE)
+        doc.ensure_sections()
+        ops.add(doc, "あとで読む", TUE, section=section_name)
+        return doc
+
+    def test_startup_selects_first_non_empty_section(self):
+        app = self.make_app(self.doc_with_task_in(model.PARKING_LOT))
+        app.focus_first_non_empty()
+        self.assertEqual(app.current_section().name, model.PARKING_LOT)
+        self.assertEqual(len(app.rows()), 1)
+
+    def test_startup_keeps_today_when_it_has_tasks(self):
+        doc = self.doc_with_task_in(model.PARKING_LOT)
+        ops.add(doc, "今日のタスク", TUE, section=model.TODAY)
+        app = self.make_app(doc)
+        app.focus_first_non_empty()
+        self.assertEqual(app.current_section().name, model.TODAY)
+
+    def test_startup_on_empty_file_stays_on_today(self):
+        doc = parser.parse_text("", base=TUE)
+        doc.ensure_sections()
+        app = self.make_app(doc)
+        app.focus_first_non_empty()
+        self.assertEqual(app.current_section().name, model.TODAY)
+
+    def test_j_moves_section_when_current_section_is_empty(self):
+        app = self.make_app(self.doc_with_task_in(model.PARKING_LOT))
+        self.assertEqual(app.current_section().name, model.TODAY)
+        for _ in range(4):
+            app.move_cursor(1, len(app.rows()))
+        self.assertEqual(app.current_section().name, model.PARKING_LOT)
+        self.assertEqual(len(app.rows()), 1)
+
+    def test_j_moves_task_when_section_has_tasks(self):
+        doc = parser.parse_text("", base=TUE)
+        doc.ensure_sections()
+        ops.add(doc, "1件目", TUE, section=model.TODAY)
+        ops.add(doc, "2件目", TUE, section=model.TODAY)
+        app = self.make_app(doc)
+        app.move_cursor(1, len(app.rows()))
+        self.assertEqual(app.current_section().name, model.TODAY)
+        self.assertEqual(app.current_task().title, "2件目")
+
+    def test_empty_search_result_does_not_move_section(self):
+        app = self.make_app(self.doc_with_task_in(model.PARKING_LOT))
+        app.filter = ("keyword", "該当しない語")
+        self.assertEqual(app.rows(), [])
+        app.move_cursor(1, 0)
+        self.assertEqual(app.current_section().name, model.TODAY)
+        self.assertIsNotNone(app.filter)
+
+    def test_reopening_shows_tasks_added_in_a_previous_session(self):
+        """TUI で追加 → 終了 → 再起動、でタスクが見えること。
+
+        「再起動すると見えないが、何か追加すると以前の分も見える」という
+        報告の再現。原因は読み込みではなくカーソル位置だった。
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            st = store.Store(Path(tmp))
+            st.init()
+
+            # セッション1: タスクを追加して保存する
+            doc = st.load(TUE)
+            ops.add(doc, "買い物", TUE)
+            st.save(doc)
+
+            # セッション2: 読み直した時点でモデルに載っていること
+            reloaded = st.load(TUE)
+            self.assertEqual([t.title for t in reloaded.all_tasks()], ["買い物"])
+            self.assertEqual(
+                [t.title for t in reloaded.section(model.PARKING_LOT).tasks], ["買い物"]
+            )
+
+            # 起動直後の画面にそのタスクが出ること
+            app = self.make_app(reloaded)
+            app.focus_first_non_empty()
+            self.assertEqual([t.title for t, _ in app.rows()], ["買い物"])
+
+    def test_help_line_always_keeps_help_and_quit(self):
+        for width in (20, 30, 46, 60, 78, 120, 200):
+            with self.subTest(width=width):
+                line = tui.help_line(width)
+                self.assertLessEqual(util.display_width(line), width)
+                self.assertIn("?:ヘルプ", line)
+                self.assertIn("q:終了", line)
+
+    def test_help_line_shows_section_keys_at_usual_widths(self):
+        for width in (46, 80, 120):
+            with self.subTest(width=width):
+                self.assertIn("J/K:セクション", tui.help_line(width))
 
 
 class UtilTest(unittest.TestCase):

@@ -12,19 +12,54 @@ LEFT_WIDTH = 16
 MIN_WIDTH = 40
 MIN_HEIGHT = 10
 
-HELP_LINE = (
-    "j/k:移動  Enter:詳細  a:追加  i:編集  s:状態  d:完了  x:やらない  "
-    "m:移動  /:検索  t:タグ  r:再配置  A:整理  w:警告  e:編集  ?:ヘルプ  q:終了"
-)
+#: フッタに詰め込む操作。幅が足りなければ後ろから削る。
+HELP_ITEMS = [
+    ("j/k", "移動"),
+    ("J/K", "セクション"),
+    ("Enter", "詳細"),
+    ("a", "追加"),
+    ("s", "状態"),
+    ("d", "完了"),
+    ("x", "やらない"),
+    ("m", "移動"),
+    ("i", "編集"),
+    ("/", "検索"),
+    ("t", "タグ"),
+    ("r", "再配置"),
+    ("A", "整理"),
+    ("w", "警告"),
+    ("e", "エディタ"),
+    ("R", "再読込"),
+]
+#: 幅が狭くても必ず残す操作。ヘルプへの入口を失わせない。
+HELP_TAIL = [("?", "ヘルプ"), ("q", "終了")]
+
+
+def help_line(width: int) -> str:
+    """端末幅に収まる範囲でキーヘルプを組み立てる。"""
+    tail = "  ".join("%s:%s" % item for item in HELP_TAIL)
+    budget = width - display_width(tail) - 2
+    parts: list[str] = []
+    used = 0
+    for key, label in HELP_ITEMS:
+        item = "%s:%s" % (key, label)
+        cost = display_width(item) + (2 if parts else 0)
+        if used + cost > budget:
+            break
+        parts.append(item)
+        used += cost
+    return "  ".join(parts + [tail]) if parts else tail
+
 
 HELP_TEXT = [
     "キー操作",
     "",
-    "  j / ↓        次のタスクへ",
-    "  k / ↑        前のタスクへ",
-    "  g / G        先頭 / 末尾へ",
-    "  h / l / Tab  セクションとタスクの行き来",
+    "  j / ↓        次のタスクへ（空のセクションでは次のセクションへ）",
+    "  k / ↑        前のタスクへ（空のセクションでは前のセクションへ）",
     "  J / K        次 / 前のセクションへ",
+    "  g / G        先頭 / 末尾へ",
+    "  h / l        セクションペインへ / タスクペインへ",
+    "  Tab          ペインを切り替える",
     "  Enter        タスクの詳細を表示",
     "  a            タスクを追加",
     "  i            タイトルを簡易編集",
@@ -67,6 +102,7 @@ class App:
         curses.curs_set(0)
         self.screen.keypad(True)
         self._startup_maintenance()
+        self.focus_first_non_empty()
 
     # ------------------------------------------------------------ 状態
 
@@ -115,6 +151,19 @@ class App:
 
     def reload(self):
         self.ctx.doc = self.ctx.store.load(self.ctx.base)
+
+    def focus_first_non_empty(self):
+        """タスクのある最初のセクションを選ぶ。
+
+        Today が空のまま起動すると、タスクが1件も見えない画面になり、
+        セクションを移せることに気づけないため。
+        """
+        for i, section in enumerate(self.sections()):
+            if section.tasks:
+                self.section_idx = i
+                self.task_idx = 0
+                self.scroll = 0
+                return
 
     # ------------------------------------------------------------ 起動時の提案
 
@@ -173,8 +222,12 @@ class App:
             self.set_cursor(0)
         elif key == "G":
             self.set_cursor(max(0, len(rows) - 1))
-        elif key in ("\t", "h", "l"):
+        elif key == "\t":
             self.focus = "sections" if self.focus == "tasks" else "tasks"
+        elif key == "h":
+            self.focus = "sections"
+        elif key == "l":
+            self.focus = "tasks"
         elif key == "J":
             self.change_section(1)
         elif key == "K":
@@ -224,6 +277,10 @@ class App:
             return
         if total:
             self.task_idx = max(0, min(self.task_idx + delta, total - 1))
+        elif not self.filter:
+            # 空のセクションで j/k が無反応だと行き止まりに見えるため、
+            # そのままセクション移動として扱う。
+            self.change_section(delta)
 
     def set_cursor(self, index: int):
         if self.focus == "sections":
@@ -450,7 +507,13 @@ class App:
                 )
             right_text = ""
             row_index = self.scroll + i
-            if row_index < len(rows):
+            if not rows and i == 0:
+                right_text = truncate(
+                    "  該当なし  Esc で解除" if self.filter
+                    else "  (タスクなし)  j/k または J/K でセクション移動",
+                    right_w,
+                )
+            elif row_index < len(rows):
                 task, depth = rows[row_index]
                 marker = ">" if row_index == self.task_idx and self.focus == "tasks" else " "
                 prefix = "%s %s" % (marker, "  " * depth)
@@ -467,7 +530,8 @@ class App:
                 self._addstr(y, left_w + 2, pad(right_text, right_w), attr)
 
         self._addstr(height - 4, 0, _hline("├", "┴", "┤", left_w, right_w))
-        self._addstr(height - 3, 0, "│%s│" % pad(truncate(HELP_LINE, width - 2), width - 2))
+        self._addstr(height - 3, 0,
+                     "│%s│" % pad(truncate(help_line(width - 2), width - 2), width - 2))
         status = self.message or self._status_line(rows)
         self._addstr(height - 2, 0, "│%s│" % pad(truncate(status, width - 2), width - 2))
         self._addstr(height - 1, 0, "└" + "─" * (width - 2) + "┘")
