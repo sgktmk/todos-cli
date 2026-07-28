@@ -32,6 +32,48 @@
 | `TODOS_TUI_POWERLINE` | `1` で TUI のステータスバーに Nerd Font の区切りを使う |
 | `NO_COLOR` | 設定されていれば TUI で色を使わない |
 
+### 外部エディタの設定
+
+`todos edit`（オプション無し）・`todos edit -e`・TUI の `I` / `e` は外部エディタを開く。
+`VISUAL` を先に見て、無ければ `EDITOR` を使う（POSIX の慣習どおり。
+どちらも未設定なら、その旨を表示して何もしない）。
+
+シェルの起動ファイルに書いておく。
+
+| シェル | ファイル | 書き方 |
+| --- | --- | --- |
+| zsh | `~/.zshrc` | `export EDITOR='vim'` |
+| bash | `~/.bashrc`（macOS のログインシェルは `~/.bash_profile`） | `export EDITOR='vim'` |
+| fish | `~/.config/fish/config.fish` | `set -gx EDITOR vim` |
+
+値は `shlex.split` で分解してから起動するため、引数を付けられる。
+
+```sh
+export EDITOR='vim'                 # Vim
+export EDITOR='nvim'                # Neovim
+export EDITOR='nano'                # Nano
+export EDITOR='emacs -nw'           # Emacs（端末内）
+export EDITOR='code --wait'         # VS Code
+export EDITOR='cursor --wait'       # Cursor
+export EDITOR='subl --wait'         # Sublime Text
+```
+
+GUI エディタには `--wait`（`-w`）を必ず付ける。`todos` は一時ファイルを開いた
+プロセスの終了を待って内容を読み直すため、待たないエディタでは編集前の内容が
+読まれて「変更はありません」になる。
+
+エディタが 0 以外の終了コードを返した場合は編集を破棄する。
+Vim なら `:cq` が「保存せずに中止」として使える。
+
+その起動だけ変えたい場合は前置きで渡す。
+
+```sh
+EDITOR=nano todos edit 3
+VISUAL=nvim todos          # VISUAL が優先される
+```
+
+一時ファイルの拡張子は `.md` なので、エディタは Markdown として扱う。
+
 ### タスクの指定子
 
 `SELECTOR` には次のどちらかを渡す。

@@ -215,6 +215,21 @@ todos validate --fix                  # 構文検証と修正
 
 詳細は [`docs/tui.md`](docs/tui.md)。
 
+## 外部エディタ
+
+`todos edit`（オプション省略時）と TUI の `I` / `e` は外部エディタを開く。
+`VISUAL` を先に見て、無ければ `EDITOR` を使う。シェルの起動ファイル
+（zsh なら `~/.zshrc`）に書いておく。
+
+```sh
+export EDITOR='vim'          # 端末内のエディタ
+export EDITOR='code --wait'  # GUI エディタは --wait を付ける
+```
+
+GUI エディタで `--wait` を省くとプロセスが即座に終了し、編集前の内容が読まれる。
+
+設定方法の詳細は [`docs/cli.md`](docs/cli.md#外部エディタの設定)。
+
 ## AI エージェントから使う
 
 表示系コマンドは JSON を出力し、更新系コマンドは `--yes` で確認を省略できる。
