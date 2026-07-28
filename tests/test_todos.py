@@ -187,6 +187,67 @@ class ScheduleTest(unittest.TestCase):
             self.place(status=model.HOLD, due=dt.date(2026, 7, 29)), model.TODAY
         )
 
+    def reason(self, **kwargs):
+        return schedule.reason(model.Task(title="x", **kwargs), TUE)
+
+    def test_reason_explains_each_placement(self):
+        cases = [
+            ({"due": dt.date(2026, 7, 20)}, "期限切れ"),
+            ({"due": dt.date(2026, 7, 28)}, "本日が期限"),
+            ({"due": dt.date(2026, 7, 29)}, "明日が期限"),
+            ({"due": dt.date(2026, 7, 30)}, "明後日が期限"),
+            ({"due": dt.date(2026, 8, 2)}, "今週が期限"),
+            ({"due": dt.date(2026, 8, 3)}, "来週以降が期限"),
+            ({"status": model.TODO}, "期日なし"),
+            ({"status": model.HOLD}, "期日なし"),
+            ({"status": model.DOING}, "期日なし・仕掛中"),
+            ({"status": model.DONE}, "終了済み"),
+        ]
+        for kwargs, expected in cases:
+            with self.subTest(**kwargs):
+                self.assertEqual(self.reason(**kwargs), expected)
+
+    def test_reason_fits_the_preview_column(self):
+        # TUI の理由列は 18 桁。はみ出すと表が崩れる
+        for status in model.STATUSES:
+            for due in (None, dt.date(2026, 7, 20), dt.date(2026, 9, 1)):
+                task = model.Task(title="x", status=status, due=due)
+                with self.subTest(status=status, due=due):
+                    self.assertLessEqual(
+                        util.display_width(schedule.reason(task, TUE)), 18
+                    )
+
+    def test_rollover_converges_so_it_is_not_proposed_again(self):
+        """一度承諾したら次回は提案されないこと（同じ基準日なら食い違いは消える）。"""
+        doc = parser.parse_text(
+            "## Today\n\n"
+            "- [ ] 期日なし\n"
+            "- [ ] 【進行中】期日なしで進行中\n"
+            "- [ ] 先の予定（〜2026/09/30）\n"
+            "## Tomorrow\n\n- [ ] 明日（〜2026/07/29）\n"
+            "## InWeek\n\n## OpenEnded\n\n## ParkingLot\n\n"
+            "- [ ] 【要返答】期限切れ（〜2026/07/01）\n",
+            base=TUE,
+        )
+        self.assertTrue(schedule.needs_rollover(doc, TUE))
+        schedule.rollover(doc, TUE)
+        self.assertFalse(schedule.needs_rollover(doc, TUE))
+        # 書き出して読み直しても再提案されない
+        again = parser.parse_text(render.render_document(doc), base=TUE)
+        self.assertFalse(schedule.needs_rollover(again, TUE))
+
+    def test_manual_move_against_the_rule_is_reported_again(self):
+        """手動移動は要件11.6のとおり再評価対象。提案が再度出るのは仕様。"""
+        doc = parser.parse_text(
+            "## Today\n\n## Tomorrow\n\n## InWeek\n\n## OpenEnded\n\n"
+            "## ParkingLot\n\n- [ ] 期日なしだが今日やりたい\n",
+            base=TUE,
+        )
+        task = doc.section(model.PARKING_LOT).tasks[0]
+        schedule.move(doc, task, model.TODAY)
+        self.assertTrue(schedule.needs_rollover(doc, TUE))
+        self.assertEqual(schedule.misplaced(doc, TUE), [(task, model.PARKING_LOT)])
+
     def test_week_end_is_sunday(self):
         self.assertEqual(util.week_end(dt.date(2026, 7, 28)), dt.date(2026, 8, 2))
         self.assertEqual(util.week_end(dt.date(2026, 8, 2)), dt.date(2026, 8, 2))
@@ -306,6 +367,36 @@ class OpsTest(unittest.TestCase):
         self.assertEqual([t.title for t in data["in_flight"]], ["仕掛"])
         self.assertEqual([t.title for t in data["done"]], ["済"])
         self.assertEqual([t.title for t in data["skipped"]], ["やめ"])
+
+
+class TagOpsTest(unittest.TestCase):
+    def task(self, tags=()):
+        return model.Task(title="x", tags=list(tags))
+
+    def test_set_tags_normalizes_hashes_and_duplicates(self):
+        task = self.task(["old"])
+        ops.set_tags(task, ["#api", "backend", "api", "  ", "#api"])
+        self.assertEqual(task.tags, ["api", "backend"])
+
+    def test_set_tags_clears_with_empty_list(self):
+        task = self.task(["api"])
+        ops.set_tags(task, [])
+        self.assertEqual(task.tags, [])
+
+    def test_set_tags_rejects_unwritable_tags(self):
+        for bad in ("a b", "a#b", "タグ\tつき"):
+            with self.subTest(tag=bad):
+                task = self.task(["keep"])
+                with self.assertRaises(util.TodosError):
+                    ops.set_tags(task, [bad])
+                self.assertEqual(task.tags, ["keep"])
+
+    def test_set_tags_round_trips_through_markdown(self):
+        doc = parser.parse_text("## Today\n\n- [ ] タグ入れ替え #before\n", base=TUE)
+        task = doc.section("Today").tasks[0]
+        ops.set_tags(task, ["after", "後ろ"])
+        again = parser.parse_text(render.render_document(doc), base=TUE)
+        self.assertEqual(again.all_tasks()[0].tags, ["after", "後ろ"])
 
 
 class ArchiveTest(unittest.TestCase):
@@ -456,6 +547,29 @@ class CliTest(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertIn("テスト", out)
 
+    def test_rollover_lists_reasons_before_confirming(self):
+        (self.dir / "tasks.md").write_text(
+            "## Today\n\n- [ ] 期日なしの用事\n"
+            "## Tomorrow\n\n## InWeek\n\n## OpenEnded\n\n## ParkingLot\n",
+            encoding="utf-8",
+        )
+        code, out = self.run_cli("rollover", "--yes")
+        self.assertEqual(code, 0)
+        self.assertIn("期日なし", out)
+        self.assertIn("Today -> ParkingLot", out)
+        self.assertIn("期日なしの用事", out)
+        self.assertIn("配置ルール", out)
+
+    def test_format_moves_aligns_columns(self):
+        doc = parser.parse_text("## Today\n\n- [ ] あ\n- [ ] い\n", base=TUE)
+        first, second = doc.section("Today").tasks
+        lines = cli.format_moves(
+            TUE,
+            [(first, "Today", "ParkingLot"), (second, "Tomorrow", "Today")],
+        )
+        heads = [line.index(t.title) for line, t in zip(lines, (first, second))]
+        self.assertEqual(len(set(heads)), 1)
+
     def test_json_output_is_machine_readable(self):
         import json
 
@@ -587,6 +701,239 @@ class EditorTest(unittest.TestCase):
         with self.assertRaises(util.TodosError):
             editor.edit_task(doc, task)
         self.assertEqual([t.title for t in doc.top_tasks()], ["消さない"])
+
+    def task_with_detail(self):
+        doc = parser.parse_text(
+            "## Today\n\n"
+            "- [ ] 【進行中】残るタイトル\n"
+            "  古い詳細\n"
+            "  - [ ] 残る子\n",
+            base=TUE,
+        )
+        return doc.section("Today").tasks[0]
+
+    def test_edit_detail_replaces_only_the_detail(self):
+        task = self.task_with_detail()
+        self.fake_editor("新しい詳細\n2行目\n")
+        self.assertTrue(editor.edit_detail(task))
+        self.assertEqual(task.detail, ["新しい詳細", "2行目"])
+        # タイトル・ステータス・子タスクには触らない
+        self.assertEqual(task.title, "残るタイトル")
+        self.assertEqual(task.status, model.DOING)
+        self.assertEqual([c.title for c in task.children], ["残る子"])
+
+    def test_edit_detail_without_change_returns_false(self):
+        task = self.task_with_detail()
+        self.fake_editor("古い詳細\n")
+        self.assertFalse(editor.edit_detail(task))
+        self.assertEqual(task.detail, ["古い詳細"])
+
+    def test_edit_detail_can_clear_the_detail(self):
+        task = self.task_with_detail()
+        self.fake_editor("\n")
+        self.assertTrue(editor.edit_detail(task))
+        self.assertEqual(task.detail, [])
+
+    def test_edit_detail_rejects_bullet_lines(self):
+        task = self.task_with_detail()
+        self.fake_editor("- [ ] 子タスクのつもり\n")
+        with self.assertRaises(util.TodosError):
+            editor.edit_detail(task)
+        self.assertEqual(task.detail, ["古い詳細"])
+
+    def test_edit_detail_round_trips_through_the_file(self):
+        task = self.task_with_detail()
+        self.fake_editor("書き直した詳細\n")
+        editor.edit_detail(task)
+        doc = parser.parse_text(
+            "## Today\n\n%s\n" % "\n".join(render.render_task(task, 0)), base=TUE
+        )
+        again = doc.section("Today").tasks[0]
+        self.assertEqual(again.detail, ["書き直した詳細"])
+        self.assertEqual([c.title for c in again.children], ["残る子"])
+
+
+class TuiEditTest(unittest.TestCase):
+    """curses を起動せず、入力欄の応答だけ差し替えて編集操作を検証する。"""
+
+    def make_app(self, text):
+        # 必須セクションが欠けていると解析時に MISSING_SECTION 警告が付くので、
+        # 与えられた見出しに足りない分を補ってから解析する。
+        body = text
+        for name in model.SECTIONS:
+            if "## %s" % name not in body:
+                body += "\n## %s\n" % name
+        doc = parser.parse_text(body, base=TUE)
+        app = tui.App.__new__(tui.App)
+        app.ctx = type("Ctx", (), {"doc": doc, "base": TUE})()
+        app.theme = theme.Theme("mono").setup()
+        app.section_idx = 0
+        app.task_idx = 0
+        app.scroll = 0
+        app.focus = "tasks"
+        app.filter = None
+        app.message = ""
+        app.saved = 0
+        app.save = lambda: setattr(app, "saved", app.saved + 1)
+        app.notify = lambda text, kind="info": setattr(app, "message", text)
+        return app, doc
+
+    def answer(self, app, *values):
+        """prompt が順に values を返すようにする。"""
+        it = iter(values)
+        app.prompt = lambda label, initial="": next(it)
+
+    # ------------------------------------------------------------ 期日
+
+    def test_edit_due_sets_and_follows_the_rule(self):
+        app, doc = self.make_app("## ParkingLot\n\n- [ ] 期日を付ける\n")
+        app.section_idx = [s.name for s in app.sections()].index(model.PARKING_LOT)
+        task = doc.section(model.PARKING_LOT).tasks[0]
+        self.answer(app, "7/29")
+        app.edit_due()
+        self.assertEqual(task.due, dt.date(2026, 7, 29))
+        # 期日を入れたらルールどおり Today へ移す（放置すると再配置を提案される）
+        self.assertEqual(task.section, model.TODAY)
+        self.assertIn("Today", app.message)
+        self.assertEqual(app.saved, 1)
+
+    def test_edit_due_clears_on_empty_input(self):
+        app, doc = self.make_app("## Today\n\n- [ ] 【進行中】消す（〜2026/07/28）\n")
+        task = doc.section(model.TODAY).tasks[0]
+        self.answer(app, "")
+        app.edit_due()
+        self.assertIsNone(task.due)
+        # 期日なしの進行中は OpenEnded
+        self.assertEqual(task.section, model.OPEN_ENDED)
+
+    def test_edit_due_rejects_garbage_and_keeps_the_old_value(self):
+        app, doc = self.make_app("## Today\n\n- [ ] そのまま（〜2026/07/28）\n")
+        task = doc.section(model.TODAY).tasks[0]
+        self.answer(app, "きのう")
+        with self.assertRaises(util.TodosError):
+            app.edit_due()
+        self.assertEqual(task.due, dt.date(2026, 7, 28))
+        self.assertEqual(app.saved, 0)
+
+    def test_edit_due_cancelled_changes_nothing(self):
+        app, doc = self.make_app("## Today\n\n- [ ] そのまま（〜2026/07/28）\n")
+        task = doc.section(model.TODAY).tasks[0]
+        self.answer(app, None)
+        app.edit_due()
+        self.assertEqual(task.due, dt.date(2026, 7, 28))
+        self.assertEqual(app.saved, 0)
+
+    def test_edit_due_does_not_move_child_tasks(self):
+        app, doc = self.make_app("## ParkingLot\n\n- [ ] 親\n  - [ ] 子\n")
+        app.section_idx = [s.name for s in app.sections()].index(model.PARKING_LOT)
+        app.task_idx = 1
+        child = doc.section(model.PARKING_LOT).tasks[0].children[0]
+        self.assertIs(app.current_task(), child)
+        self.answer(app, "7/29")
+        app.edit_due()
+        self.assertEqual(child.due, dt.date(2026, 7, 29))
+        self.assertEqual(child.section, model.PARKING_LOT)
+
+    # ------------------------------------------------------------ タグ
+
+    def test_edit_tags_replaces_the_whole_set(self):
+        app, doc = self.make_app("## Today\n\n- [ ] タグつき #work #urgent\n")
+        task = doc.section(model.TODAY).tasks[0]
+        self.answer(app, "api #backend api")
+        app.edit_tags()
+        self.assertEqual(task.tags, ["api", "backend"])  # # は任意、重複は除く
+
+    def test_edit_tags_clears_on_empty_input(self):
+        app, doc = self.make_app("## Today\n\n- [ ] タグつき #work\n")
+        task = doc.section(model.TODAY).tasks[0]
+        self.answer(app, "")
+        app.edit_tags()
+        self.assertEqual(task.tags, [])
+
+    def test_edit_tags_survives_a_round_trip(self):
+        app, doc = self.make_app("## Today\n\n- [ ] タグつき #work\n")
+        task = doc.section(model.TODAY).tasks[0]
+        self.answer(app, "api backend")
+        app.edit_tags()
+        again = parser.parse_text(render.render_document(doc), base=TUE)
+        self.assertEqual(again.all_tasks()[0].tags, ["api", "backend"])
+
+    # ------------------------------------------------------------ 子タスク
+
+    def test_add_child_attaches_to_the_selected_task(self):
+        app, doc = self.make_app("## Today\n\n- [ ] 親タスク\n")
+        parent = doc.section(model.TODAY).tasks[0]
+        self.answer(app, "子タスク")
+        app.add_child()
+        self.assertEqual([c.title for c in parent.children], ["子タスク"])
+        self.assertIs(parent.children[0].parent, parent)
+        self.assertEqual(parent.children[0].section, model.TODAY)
+        # トップレベルは増えない
+        self.assertEqual(len(doc.section(model.TODAY).tasks), 1)
+
+    def test_add_child_survives_a_round_trip(self):
+        app, doc = self.make_app("## Today\n\n- [ ] 親タスク\n")
+        self.answer(app, "子タスク")
+        app.add_child()
+        again = parser.parse_text(render.render_document(doc), base=TUE)
+        top = again.section(model.TODAY).tasks[0]
+        self.assertEqual([c.title for c in top.children], ["子タスク"])
+
+    # ------------------------------------------------------------ 相手
+
+    def test_counterpart_can_be_cleared_from_the_status_flow(self):
+        app, doc = self.make_app("## Today\n\n- [ ] 【要返答（山田）】確認\n")
+        task = doc.section(model.TODAY).tasks[0]
+        app.choose = lambda *a, **k: list(model.STATUSES).index(model.NEEDS_REPLY)
+        self.answer(app, "")
+        app.change_status()
+        self.assertEqual(task.status, model.NEEDS_REPLY)
+        self.assertIsNone(task.counterpart)
+        self.assertEqual(task.status_label(), model.NEEDS_REPLY)
+
+    def test_counterpart_can_be_replaced(self):
+        app, doc = self.make_app("## Today\n\n- [ ] 【要返答（山田）】確認\n")
+        task = doc.section(model.TODAY).tasks[0]
+        app.choose = lambda *a, **k: list(model.STATUSES).index(model.WAITING)
+        self.answer(app, "田中")
+        app.change_status()
+        self.assertEqual(task.counterpart, "田中")
+
+    # ------------------------------------------------------------ 警告の修正
+
+    def test_show_warnings_applies_fixes_on_yes(self):
+        app, doc = self.make_app(
+            "## Today\n\n- [x] 【未着手】ずれている（〜2026/07/28）\n"
+        )
+        asked = {}
+        app.popup_ask = lambda title, lines, hint: asked.setdefault("hint", hint) or True
+        app.popup = lambda *a, **k: self.fail("修正できるなら確認モーダルを出すこと")
+        app.show_warnings()
+        self.assertEqual(doc.all_tasks()[0].status, model.DONE)
+        self.assertIn("1 件を修正", asked["hint"])
+        self.assertEqual(app.saved, 1)
+        self.assertEqual(validate.validate(doc), [])
+
+    def test_show_warnings_keeps_the_file_on_no(self):
+        app, doc = self.make_app(
+            "## Today\n\n- [x] 【未着手】ずれている（〜2026/07/28）\n"
+        )
+        app.popup_ask = lambda title, lines, hint: False
+        app.show_warnings()
+        self.assertEqual(doc.all_tasks()[0].status, model.TODO)
+        self.assertEqual(app.saved, 0)
+
+    def test_show_warnings_only_displays_when_nothing_is_fixable(self):
+        app, doc = self.make_app(
+            "## Today\n\n- [ ] 【完了】親（〜2026/07/28）\n  - [ ] 未完了の子\n"
+        )
+        # 完了とチェックボックスのずれは直せるので、直せない問題だけを残す
+        doc.all_tasks()[0].checked = True
+        shown = {}
+        app.popup = lambda title, lines: shown.setdefault("title", title)
+        app.popup_ask = lambda *a, **k: self.fail("直せない問題で確認を求めないこと")
+        app.show_warnings()
+        self.assertIn("警告", shown["title"])
 
 
 class TuiNavigationTest(unittest.TestCase):
@@ -756,6 +1103,96 @@ class TuiRenderTest(unittest.TestCase):
             else:
                 os.environ["TODOS_AMBIGUOUS_WIDTH"] = old
 
+    def stub_keys(self, app, keys):
+        """get_wch が順に keys を返す画面を差し込む。"""
+        it = iter(keys)
+        app.screen = type("S", (), {"get_wch": staticmethod(lambda: next(it))})()
+
+    def test_popup_ask_accepts_only_y(self):
+        app = self.make_app(parser.parse_text("## Today\n", base=TUE))
+        app.geometry = lambda: (20, 80, 18, 58)
+        app._popup_draw = lambda *a, **k: None
+        for keys, expected in ([["y"], True], [["Y"], True], [["\n"], False],
+                               [["\x1b"], False], [["n"], False]):
+            with self.subTest(keys=keys):
+                self.stub_keys(app, keys)
+                self.assertEqual(app.popup_ask("t", [["x"]], "hint"), expected)
+
+    def test_popup_ask_scrolls_without_closing(self):
+        app = self.make_app(parser.parse_text("## Today\n", base=TUE))
+        app.geometry = lambda: (20, 80, 18, 58)
+        heads = []
+        app._popup_draw = lambda title, lines, hint=None: heads.append(lines[0][0][0])
+        self.stub_keys(app, ["j", "j", "k", "y"])
+        lines = [[("行%d" % i, None)] for i in range(30)]
+        self.assertTrue(app.popup_ask("t", lines, "hint"))
+        self.assertEqual(heads, ["行0", "行1", "行2", "行1"])
+
+    def test_move_table_shows_reason_and_destination(self):
+        doc = parser.parse_text(
+            "## Today\n\n- [ ] 期日なしの用事\n", base=TUE
+        )
+        app = self.make_app(doc)
+        app.geometry = lambda: (24, 100, 18, 78)
+        task = doc.section("Today").tasks[0]
+        text = "\n".join("".join(t for t, _ in spans)
+                         for spans in app._move_table([(task, "Today", "ParkingLot")]))
+        self.assertIn("期日なし", text)
+        self.assertIn("Today", text)
+        self.assertIn("ParkingLot", text)
+        self.assertIn("期日なしの用事", text)
+
+    def test_move_table_keeps_titles_on_narrow_terminals(self):
+        doc = parser.parse_text(
+            "## Today\n\n- [ ] とても長いタスク名をつけた予定表の項目\n", base=TUE
+        )
+        app = self.make_app(doc)
+        app.geometry = lambda: (24, 40, 10, 26)
+        task = doc.section("Today").tasks[0]
+        rows = ["".join(t for t, _ in spans)
+                for spans in app._move_table([(task, "Today", "ParkingLot")])]
+        # 狭い端末では2行に分け、タイトルを切り詰めない
+        self.assertEqual(len(rows), 2)
+        self.assertIn("とても長いタスク名をつけた予定表の項目", rows[0])
+        self.assertIn("ParkingLot", rows[1])
+
+    def test_detail_marker_marks_only_tasks_with_detail(self):
+        doc = parser.parse_text(
+            "## Today\n\n- [ ] 詳細つき\n  説明\n- [ ] 詳細なし\n", base=TUE
+        )
+        app = self.make_app(doc)
+        having, lacking = doc.section("Today").tasks
+        mark = app.theme.glyph("detail")
+        self.assertIn(mark, "".join(t for t, _ in app._task_spans(having, 0, False)))
+        self.assertNotIn(mark, "".join(t for t, _ in app._task_spans(lacking, 0, False)))
+
+    def detail_modal_lines(self, doc, width):
+        app = self.make_app(doc)
+        app.geometry = lambda: (24, width, 18, width - 22)
+        captured = []
+        app.popup = lambda title, lines: captured.extend(lines)
+        app.show_detail()
+        return ["".join(t for t, _ in spans) for spans in captured
+                if not isinstance(spans, str)]
+
+    def test_detail_modal_wraps_instead_of_truncating(self):
+        body = "あ" * 60
+        doc = parser.parse_text("## Today\n\n- [ ] 長い詳細\n  %s\n" % body, base=TUE)
+        rows = [line for line in self.detail_modal_lines(doc, 80) if "あ" in line]
+        self.assertGreater(len(rows), 1)
+        for line in rows:
+            self.assertNotIn("…", line)
+            self.assertLessEqual(util.display_width(line), 80 - 6)
+        self.assertEqual("".join(line.strip() for line in rows), body)
+
+    def test_detail_modal_wraps_on_narrow_terminals(self):
+        body = "あ" * 60
+        doc = parser.parse_text("## Today\n\n- [ ] 長い詳細\n  %s\n" % body, base=TUE)
+        rows = [line for line in self.detail_modal_lines(doc, 40) if "あ" in line]
+        for line in rows:
+            self.assertLessEqual(util.display_width(line), 40 - 6)
+        self.assertEqual("".join(line.strip() for line in rows), body)
+
     def test_scroll_label(self):
         self.assertEqual(tui._scroll_label(0, 3, 10), "全て")
         self.assertEqual(tui._scroll_label(0, 30, 10), "先頭")
@@ -820,6 +1257,29 @@ class UtilTest(unittest.TestCase):
         self.assertLessEqual(util.display_width(util.truncate("あいうえお", 6)), 6)
         self.assertLess(len(util.truncate("あいうえお", 6)), len("あいうえお"))
         self.assertEqual(util.truncate("あいうえお", 20), "あいうえお")
+
+    def test_wrap_keeps_every_line_within_width(self):
+        text = "あ" * 30
+        lines = util.wrap(text, 20)
+        self.assertGreater(len(lines), 1)
+        for line in lines:
+            self.assertLessEqual(util.display_width(line), 20)
+        self.assertEqual("".join(lines), text)
+
+    def test_wrap_prefers_spaces_when_present(self):
+        self.assertEqual(
+            util.wrap("alpha bravo charlie delta", 12), ["alpha bravo", "charlie", "delta"]
+        )
+
+    def test_wrap_does_not_emit_blank_lines_for_indented_text(self):
+        lines = util.wrap("    " + "あ" * 30, 20)
+        self.assertTrue(all(line.strip() for line in lines))
+        self.assertTrue(lines[0].startswith("    "))
+
+    def test_wrap_passes_short_and_empty_text_through(self):
+        self.assertEqual(util.wrap("短い", 20), ["短い"])
+        self.assertEqual(util.wrap("", 20), [""])
+        self.assertEqual(util.wrap("幅ゼロ", 0), ["幅ゼロ"])
 
     def test_ambiguous_width_is_configurable(self):
         old = os.environ.get("TODOS_AMBIGUOUS_WIDTH")

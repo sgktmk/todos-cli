@@ -8,7 +8,7 @@ import subprocess
 import tempfile
 from pathlib import Path
 
-from . import model, parser, render
+from . import model, ops, parser, render
 from .parser import Document
 from .util import TodosError
 
@@ -78,6 +78,35 @@ def edit_task(doc: Document, task):
     container[index:index + 1] = new_tasks
     doc.reindex()
     return new_tasks[0]
+
+
+DETAIL_HEADER = (
+    "<!-- トドズ: 「%s」の詳細文を編集して保存してください。\n"
+    "     箇条書き（- * +）で始まる行は書けません（子タスクと区別できないため）。\n"
+    "     空にすると詳細文を削除します。この行は保存されません。 -->\n"
+)
+
+
+def edit_detail(task) -> bool:
+    """タスクの詳細文だけを外部エディタで編集する。取り込んだら True。
+
+    タイトル・ステータス・子タスクには触らないため、書式を知らなくても編集できる。
+    """
+    original = "\n".join(task.detail)
+    seed = original + "\n" if original else ""
+    edited = launch(DETAIL_HEADER % task.title + seed)
+    if edited is None:
+        return False
+    body = _strip_comments(edited).strip("\n")
+    if body == original:
+        return False
+    for line in body.splitlines():
+        if parser.BULLET_RE.match(line):
+            raise TodosError(
+                "詳細文に箇条書きは書けません（子タスクと区別できません）: %s" % line.strip()
+            )
+    ops.set_detail(task, body)
+    return True
 
 
 def _strip_comments(text: str) -> str:

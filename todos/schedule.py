@@ -36,6 +36,35 @@ def desired_section(task: Task, base: _dt.date) -> str | None:
     return model.PARKING_LOT
 
 
+#: 配置ルールの要約。再配置を提案するときの説明に使う。
+RULE_SUMMARY = (
+    "配置ルール: 期限切れ・本日・明日が期限は Today、明後日は Tomorrow、"
+    "当週の日曜までは InWeek、それより先は ParkingLot。"
+    "期日なしは 進行中・要返答・回答待ち が OpenEnded、未着手・保留 が ParkingLot。"
+)
+
+
+def reason(task: Task, base: _dt.date) -> str:
+    """desired_section がその判定になった理由を短く返す（説明表示用）。"""
+    if task.status in model.TERMINAL_STATUSES:
+        return "終了済み"
+    if task.due is not None:
+        if task.due < base:
+            return "期限切れ"
+        if task.due == base:
+            return "本日が期限"
+        if task.due == base + _dt.timedelta(days=1):
+            return "明日が期限"
+        if task.due == base + _dt.timedelta(days=2):
+            return "明後日が期限"
+        if task.due <= util.week_end(base):
+            return "今週が期限"
+        return "来週以降が期限"
+    if task.status in model.IN_FLIGHT_STATUSES:
+        return "期日なし・仕掛中"
+    return "期日なし"
+
+
 def misplaced(doc: Document, base: _dt.date) -> list[tuple[Task, str]]:
     """本来と異なるセクションにある未完了タスクを列挙する。"""
     out = []

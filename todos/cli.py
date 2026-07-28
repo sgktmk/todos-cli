@@ -72,10 +72,19 @@ class Context:
         if not (self.interactive or self.assume_yes):
             return
         changed = False
-        if schedule.needs_rollover(self.doc, self.base):
-            if self.confirm("日付が更新されています。タスクを再配置しますか？"):
+        moves = schedule.misplaced(self.doc, self.base)
+        if moves:
+            # 件数だけでは何がどこへ動くのか分からないため、一覧と理由を先に出す。
+            self.note("日付が変わり、次のタスクの配置がルールと食い違っています:")
+            for line in format_moves(self.base, [(t, t.section, want) for t, want in moves]):
+                self.note(line)
+            self.note(schedule.RULE_SUMMARY)
+            if self.confirm("再配置しますか？"):
                 schedule.rollover(self.doc, self.base)
                 changed = True
+            else:
+                self.note("配置は変えていません（次回も提案します。"
+                          "止めるには --no-prompt を使います）。")
         pending = ops.archivable(self.doc)
         if pending:
             if self.confirm(
@@ -88,6 +97,19 @@ class Context:
 
 
 # ---------------------------------------------------------------- 表示
+
+
+def format_moves(base, moves) -> list[str]:
+    """(タスク, 移動前, 移動後) を「理由つきの移動一覧」として整形する。"""
+    return [
+        "  %s  %s  %s"
+        % (
+            util.pad(schedule.reason(task, base), 16),
+            util.pad("%s -> %s" % (src, dst), 24),
+            task.title,
+        )
+        for task, src, dst in moves
+    ]
 
 
 def format_task_line(task, show_index: bool = True) -> str:
@@ -415,8 +437,9 @@ def cmd_rollover(ctx: Context) -> int:
         return EXIT_OK
     if not ctx.json:
         ctx.out("次のタスクを再配置します:")
-        for task, want in moves:
-            ctx.out("  [%d] %s: %s -> %s" % (task.index, task.title, task.section, want))
+        for line in format_moves(ctx.base, [(t, t.section, want) for t, want in moves]):
+            ctx.out(line)
+        ctx.out(schedule.RULE_SUMMARY)
     if not ctx.confirm("再配置を実行しますか？"):
         ctx.note("中止しました。")
         return EXIT_ERROR

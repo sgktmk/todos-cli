@@ -31,8 +31,12 @@ HELP_ITEMS = [
     ("x", "やらない"),
     ("m", "移動"),
     ("i", "編集"),
+    ("D", "期日"),
+    ("T", "タグ"),
+    ("I", "詳細文"),
+    ("o", "子タスク"),
     ("/", "検索"),
-    ("t", "タグ"),
+    ("t", "タグ検索"),
     ("r", "再配置"),
     ("A", "整理"),
     ("w", "警告"),
@@ -75,8 +79,12 @@ HELP_KEYS = [
     ("Enter", "タスクの詳細を表示"),
     ("", ""),
     ("a", "タスクを追加"),
+    ("o", "選択中のタスクの子として追加"),
     ("i", "タイトルを簡易編集"),
-    ("s", "ステータスを変更"),
+    ("I", "詳細文を編集（外部エディタ）"),
+    ("D", "期日を設定・削除（空欄で削除）"),
+    ("T", "タグを編集（空白区切り・空欄で削除）"),
+    ("s", "ステータスを変更（相手は空欄で削除）"),
     ("d", "完了にする"),
     ("x", "やらないにする"),
     ("m", "セクションを移動"),
@@ -88,7 +96,7 @@ HELP_KEYS = [
     ("", ""),
     ("r", "自動再配置 (rollover)"),
     ("A", "アーカイブ"),
-    ("w", "構文上の警告を表示"),
+    ("w", "構文上の警告を表示・修正"),
     ("R", "ファイルを読み直す"),
     ("q", "終了"),
 ]
@@ -118,8 +126,8 @@ class App:
         self.theme = theme_mod.detect().setup()
         curses.curs_set(0)
         self.screen.keypad(True)
-        self._startup_maintenance()
         self.focus_first_non_empty()
+        self._startup_maintenance()
 
     # ------------------------------------------------------------ 状態
 
@@ -191,16 +199,19 @@ class App:
     def _startup_maintenance(self):
         if getattr(self.ctx.args, "no_prompt", False):
             return
-        if schedule.needs_rollover(self.doc, self.ctx.base):
-            if self.ask("日付が更新されています。タスクを再配置しますか？"):
-                moved = schedule.rollover(self.doc, self.ctx.base)
-                self.save()
-                self.notify("%d 件を再配置しました。" % len(moved))
+        moves = schedule.misplaced(self.doc, self.ctx.base)
+        if moves:
+            # 何も描かれていない画面で問われても判断できないため、先に一覧を描く。
+            self.draw()
+            if self.confirm_moves(moves, "日付が変わり、いまの配置がルールと食い違っています。"):
+                self.apply_rollover()
         pending = ops.archivable(self.doc)
         if pending:
+            self.draw()
             if self.ask("終了したタスクが %d 件あります。アーカイブしますか？" % len(pending)):
                 archived = ops.archive(self.doc, self.ctx.store, self.ctx.base)
                 self.save()
+                self.focus_first_non_empty()
                 self.notify("%d 件をアーカイブしました。" % len(archived))
 
     # ------------------------------------------------------------ 主ループ
@@ -257,8 +268,16 @@ class App:
             self.show_detail()
         elif key == "a":
             self.add_task()
+        elif key == "o":
+            self.add_child()
         elif key == "i":
             self.rename_task()
+        elif key == "I":
+            self.edit_detail()
+        elif key == "D":
+            self.edit_due()
+        elif key == "T":
+            self.edit_tags()
         elif key == "s":
             self.change_status()
         elif key == "d":
@@ -331,6 +350,20 @@ class App:
         self.jump_to(task)
         self.notify("追加しました: %s (%s)" % (task.title, task.section))
 
+    def add_child(self):
+        """選択中のタスクの子として追加する（a はトップレベルに追加する）。"""
+        parent = self.current_task()
+        if parent is None:
+            return
+        title = self.prompt("「%s」の子タスク" % truncate(parent.title, 20), "")
+        if not title:
+            return
+        child = ops.add(self.doc, title, self.ctx.base, parent=parent)
+        self.save()
+        self.filter = None
+        self.jump_to(child)
+        self.notify("「%s」の子として追加しました。" % parent.title)
+
     def rename_task(self):
         task = self.current_task()
         if task is None:
@@ -341,6 +374,75 @@ class App:
         ops.set_title(task, title)
         self.save()
         self.notify("更新しました。")
+
+    def edit_detail(self):
+        """詳細文だけを外部エディタで編集する。TUI は複数行の入力欄を持たない。"""
+        task = self.current_task()
+        if task is None:
+            return
+        if self._outside_curses(lambda: editor.edit_detail(task)):
+            self.save()
+            self.notify("詳細文を更新しました。")
+        else:
+            self.notify("変更はありません。")
+
+    def edit_due(self):
+        """期日を設定・変更・削除する。空欄で確定すると削除。"""
+        task = self.current_task()
+        if task is None:
+            return
+        text = self.prompt("期日（空で削除）",
+                           util.format_date(task.due) if task.due else "")
+        if text is None:
+            return
+        text = text.strip()
+        if text:
+            due = util.parse_date(text, self.ctx.base)
+            if due is None:
+                raise TodosError(
+                    "期日として解釈できません: %s（例: 2026/07/31、7/31、7月31日）" % text
+                )
+            ops.set_due(task, due)
+            message = "期日を %s にしました。" % util.format_date(due)
+        else:
+            ops.set_due(task, None)
+            message = "期日を削除しました。"
+        moved = self._follow_rule(task)
+        self.save()
+        if moved:
+            self.filter = None
+            self.jump_to(task)
+            message += " ルールに従って %s へ移しました。" % moved
+        self.notify(message)
+
+    def edit_tags(self):
+        """タグを差し替える。空白区切りで入力し、空欄で確定すると削除。"""
+        task = self.current_task()
+        if task is None:
+            return
+        text = self.prompt("タグ（空白区切り・空で削除）", " ".join(task.tags))
+        if text is None:
+            return
+        ops.set_tags(task, text.split())
+        self.save()
+        if task.tags:
+            self.notify("タグを %s にしました。" % " ".join("#" + t for t in task.tags))
+        else:
+            self.notify("タグを削除しました。")
+
+    def _follow_rule(self, task):
+        """期日を変えた結果ルールと食い違うなら配置を追従させ、移動先を返す。
+
+        放置すると次回起動で再配置を提案されるため、その場で合わせる。
+        子タスクは単独で移動できないので親の配置に従う。
+        """
+        if task.parent is not None:
+            return None
+        want = schedule.desired_section(task, self.ctx.base)
+        if want is None or want == task.section:
+            return None
+        schedule.move(self.doc, task, want)
+        return want
 
     def change_status(self):
         task = self.current_task()
@@ -357,10 +459,11 @@ class App:
             return
         who = None
         if status in model.COUNTERPART_STATUSES:
-            who = self.prompt("相手（任意）", task.counterpart or "")
+            who = self.prompt("相手（任意・空で削除）", task.counterpart or "")
             if who is None:
                 return
-        ops.set_status(task, status, who or None)
+        # who を or None で潰すと空欄が「変更しない」になり、相手を消せなくなる。
+        ops.set_status(task, status, who)
         self.save()
         self.notify("ステータスを【%s】にしました。" % task.status_label())
 
@@ -412,12 +515,82 @@ class App:
         if not moves:
             self.notify("再配置の必要はありません。")
             return
-        if not self.ask("%d 件を再配置します。実行しますか？" % len(moves)):
-            return
+        if self.confirm_moves(moves, "いまの配置がルールと食い違っているタスクがあります。"):
+            self.apply_rollover()
+        else:
+            self.notify("中止しました。配置は変えていません。")
+
+    def apply_rollover(self):
+        """再配置を実行し、どのタスクがどこへ動いたかを見せる。"""
         applied = schedule.rollover(self.doc, self.ctx.base)
         self.save()
         self.task_idx = 0
+        self.focus_first_non_empty()
+        if applied:
+            # 確認モーダルを消し、移動後の配置を背景に出してから結果を見せる。
+            self.draw()
+            self.popup("再配置しました (%d 件)" % len(applied),
+                       self._move_table(applied))
         self.notify("%d 件を再配置しました。" % len(applied))
+
+    def confirm_moves(self, moves, lead: str) -> bool:
+        """移動の内容と理由を見せてから y/n を聞く。
+
+        「日付が更新されています」だけでは何がどこへ動くのか分からないため、
+        件数ではなく一覧そのものを出す。
+        """
+        lines = self._wrapped(lead, "popup.text")
+        lines.append("")
+        lines += self._move_table([(task, task.section, want) for task, want in moves])
+        lines.append("")
+        lines += self._wrapped(schedule.RULE_SUMMARY, "popup.label")
+        lines.append("")
+        lines += self._wrapped(
+            "中止した場合、配置は変わりません（食い違いが残るため次回も提案します）。",
+            "popup.label",
+        )
+        lines += self._wrapped(
+            "提案そのものを止めるには --no-prompt を付けて起動します。", "popup.label"
+        )
+        return self.popup_ask("タスクの再配置 (%d 件)" % len(moves), lines,
+                              "y で実行   他のキーで中止   j/k スクロール")
+
+    #: 理由 / 移動 / タスク を1行に並べるのに要る内寸。
+    _TABLE_WIDTH = 60
+
+    def _move_table(self, moves):
+        """(タスク, 移動前, 移動後) の一覧を作る。
+
+        幅が足りない端末では 1 行に収めるとタイトルが消えてしまうため、
+        タスク名と移動先を 2 行に分けて出す。
+        """
+        _, width, _, _ = self.geometry()
+        arrow = self.theme.glyph("arrow")
+        if width - 6 < self._TABLE_WIDTH:
+            lines = []
+            for task, src, dst in moves:
+                lines.append([("  ", None), (task.title, "popup.text")])
+                lines.append([
+                    ("      ", None),
+                    ("%s %s %s" % (src, arrow, dst), self.theme.section_role(dst)),
+                    ("  （%s）" % schedule.reason(task, self.ctx.base), "popup.label"),
+                ])
+            return lines
+        lines = [[("  ", None), (pad("理由", 18), "popup.label"),
+                  (pad("移動", 24), "popup.label"), ("タスク", "popup.label")]]
+        for task, src, dst in moves:
+            lines.append([
+                ("  ", None),
+                (pad(schedule.reason(task, self.ctx.base), 18), "popup.text"),
+                (pad("%s %s %s" % (src, arrow, dst), 24), self.theme.section_role(dst)),
+                (task.title, "popup.text"),
+            ])
+        return lines
+
+    def _wrapped(self, text: str, role: str):
+        """モーダル本文用に、端末幅で折り返した span の並びを作る。"""
+        return [[("  ", None), (chunk, role)]
+                for chunk in util.wrap(text, self._detail_width())]
 
     def do_archive(self):
         targets = ops.archivable(self.doc)
@@ -439,7 +612,25 @@ class App:
         lines = []
         for issue in found:
             lines.append([("  ! ", "popup.warn"), (issue.format().strip(), "popup.text")])
-        self.popup("構文上の警告 (%d 件)" % len(found), lines)
+        title = "構文上の警告 (%d 件)" % len(found)
+        repairable = validate.fixable(found)
+        if not repairable:
+            self.popup(title, lines)
+            return
+        # 直せる問題は、何をするかを見せたうえでその場で直せるようにする。
+        lines.append("")
+        lines.append([("  修正内容", "popup.label")])
+        for issue in repairable:
+            lines.append([("    ", None), (issue.fix_label, "popup.text")])
+        if not self.popup_ask(
+            title, lines,
+            "y で %d 件を修正   他のキーで閉じる   j/k スクロール" % len(repairable),
+        ):
+            return
+        applied = [i for i in repairable if validate.apply_fix(self.doc, i)]
+        if applied:
+            self.save()
+        self.notify("%d 件を修正しました。" % len(applied))
 
     def show_help(self):
         lines = []
@@ -471,7 +662,9 @@ class App:
         if task.detail:
             lines.append("")
             lines.append([("  詳細", "popup.label")])
-            lines += [[("    ", None), (line, "popup.text")] for line in task.detail]
+            for line in task.detail:
+                for chunk in util.wrap(line, self._detail_width()):
+                    lines.append([("    ", None), (chunk, "popup.text")])
         if task.children:
             lines.append("")
             lines.append([("  子タスク", "popup.label")])
@@ -483,17 +676,30 @@ class App:
                               (child.title, "popup.text")])
         self.popup(task.title, lines)
 
+    def _detail_width(self) -> int:
+        """詳細文を折り返す幅。
+
+        モーダルの内寸は _popup_draw が最長行から決めるが、上限は幅 - 6 になる。
+        そこから枠内の余白と字下げ 4 桁を引いた分までは切り詰められない。
+        """
+        _, width, _, _ = self.geometry()
+        return max(20, width - 12)
+
+    def _outside_curses(self, action):
+        """curses を一旦畳んで action を実行し、戻ってから画面を作り直す。"""
+        curses.def_prog_mode()
+        curses.endwin()
+        try:
+            return action()
+        finally:
+            curses.reset_prog_mode()
+            self.screen.clear()
+
     def external_edit(self):
         task = self.current_task()
         if task is None:
             return
-        curses.def_prog_mode()
-        curses.endwin()
-        try:
-            changed = editor.edit_task(self.doc, task)
-        finally:
-            curses.reset_prog_mode()
-            self.screen.clear()
+        changed = self._outside_curses(lambda: editor.edit_task(self.doc, task))
         if changed:
             self.save()
             self.notify("外部エディタの内容を反映しました。")
@@ -703,6 +909,9 @@ class App:
                           self._due_role(task.due)))
         for tag in task.tags:
             spans.append((" #%s" % tag, "tag"))
+        if task.detail:
+            # 詳細文は一覧に出せないので、あることだけ示して Enter へ誘導する。
+            spans.append((" %s" % t.glyph("detail"), "detail.mark"))
         return spans
 
     def _due_role(self, due) -> str:
@@ -915,6 +1124,30 @@ class App:
                 offset -= 1
             else:
                 return
+
+    def popup_ask(self, title: str, lines, hint: str) -> bool:
+        """一覧を見せたうえで y/n を聞くモーダル。y 以外は「いいえ」。
+
+        popup と違って j/k は閉じる操作ではなくスクロールに使う。
+        長い一覧を読もうとして中止してしまうのを避けるため。
+        """
+        offset = 0
+        while True:
+            height, _, _, _ = self.geometry()
+            visible = max(1, height - 8)
+            self._popup_draw(title, lines[offset:offset + visible], hint=hint)
+            try:
+                key = self.screen.get_wch()
+            except curses.error:
+                continue
+            if key in (curses.KEY_DOWN, "j"):
+                offset = min(offset + 1, max(0, len(lines) - visible))
+            elif key in (curses.KEY_UP, "k"):
+                offset = max(0, offset - 1)
+            elif key in ("y", "Y"):
+                return True
+            else:
+                return False
 
     def _popup_draw(self, title: str, lines, selected=None, hint: str | None = None):
         """中央に枠付きの箱を描く。lines は文字列か span の並び。"""
