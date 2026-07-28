@@ -27,6 +27,10 @@
 | `EDITOR` / `VISUAL` | 外部エディタ（`VISUAL` を優先） |
 | `TODOS_AMBIGUOUS_WIDTH` | `2` で曖昧幅文字を全角扱い |
 | `TODOS_TODAY` | 基準日を固定する（テスト用） |
+| `TODOS_TUI_THEME` | TUI の配色（`dark` / `light` / `basic` / `mono`） |
+| `TODOS_TUI_GLYPHS` | `0` で TUI の記号・罫線を ASCII に落とす |
+| `TODOS_TUI_POWERLINE` | `1` で TUI のステータスバーに Nerd Font の区切りを使う |
+| `NO_COLOR` | 設定されていれば TUI で色を使わない |
 
 ### タスクの指定子
 
