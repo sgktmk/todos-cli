@@ -120,8 +120,8 @@ class App:
         self.theme = theme_mod.detect().setup()
         curses.curs_set(0)
         self.screen.keypad(True)
-        self._startup_maintenance()
         self.focus_first_non_empty()
+        self._startup_maintenance()
 
     # ------------------------------------------------------------ 状態
 
@@ -193,16 +193,19 @@ class App:
     def _startup_maintenance(self):
         if getattr(self.ctx.args, "no_prompt", False):
             return
-        if schedule.needs_rollover(self.doc, self.ctx.base):
-            if self.ask("日付が更新されています。タスクを再配置しますか？"):
-                moved = schedule.rollover(self.doc, self.ctx.base)
-                self.save()
-                self.notify("%d 件を再配置しました。" % len(moved))
+        moves = schedule.misplaced(self.doc, self.ctx.base)
+        if moves:
+            # 何も描かれていない画面で問われても判断できないため、先に一覧を描く。
+            self.draw()
+            if self.confirm_moves(moves, "日付が変わり、いまの配置がルールと食い違っています。"):
+                self.apply_rollover()
         pending = ops.archivable(self.doc)
         if pending:
+            self.draw()
             if self.ask("終了したタスクが %d 件あります。アーカイブしますか？" % len(pending)):
                 archived = ops.archive(self.doc, self.ctx.store, self.ctx.base)
                 self.save()
+                self.focus_first_non_empty()
                 self.notify("%d 件をアーカイブしました。" % len(archived))
 
     # ------------------------------------------------------------ 主ループ
@@ -427,12 +430,82 @@ class App:
         if not moves:
             self.notify("再配置の必要はありません。")
             return
-        if not self.ask("%d 件を再配置します。実行しますか？" % len(moves)):
-            return
+        if self.confirm_moves(moves, "いまの配置がルールと食い違っているタスクがあります。"):
+            self.apply_rollover()
+        else:
+            self.notify("中止しました。配置は変えていません。")
+
+    def apply_rollover(self):
+        """再配置を実行し、どのタスクがどこへ動いたかを見せる。"""
         applied = schedule.rollover(self.doc, self.ctx.base)
         self.save()
         self.task_idx = 0
+        self.focus_first_non_empty()
+        if applied:
+            # 確認モーダルを消し、移動後の配置を背景に出してから結果を見せる。
+            self.draw()
+            self.popup("再配置しました (%d 件)" % len(applied),
+                       self._move_table(applied))
         self.notify("%d 件を再配置しました。" % len(applied))
+
+    def confirm_moves(self, moves, lead: str) -> bool:
+        """移動の内容と理由を見せてから y/n を聞く。
+
+        「日付が更新されています」だけでは何がどこへ動くのか分からないため、
+        件数ではなく一覧そのものを出す。
+        """
+        lines = self._wrapped(lead, "popup.text")
+        lines.append("")
+        lines += self._move_table([(task, task.section, want) for task, want in moves])
+        lines.append("")
+        lines += self._wrapped(schedule.RULE_SUMMARY, "popup.label")
+        lines.append("")
+        lines += self._wrapped(
+            "中止した場合、配置は変わりません（食い違いが残るため次回も提案します）。",
+            "popup.label",
+        )
+        lines += self._wrapped(
+            "提案そのものを止めるには --no-prompt を付けて起動します。", "popup.label"
+        )
+        return self.popup_ask("タスクの再配置 (%d 件)" % len(moves), lines,
+                              "y で実行   他のキーで中止   j/k スクロール")
+
+    #: 理由 / 移動 / タスク を1行に並べるのに要る内寸。
+    _TABLE_WIDTH = 60
+
+    def _move_table(self, moves):
+        """(タスク, 移動前, 移動後) の一覧を作る。
+
+        幅が足りない端末では 1 行に収めるとタイトルが消えてしまうため、
+        タスク名と移動先を 2 行に分けて出す。
+        """
+        _, width, _, _ = self.geometry()
+        arrow = self.theme.glyph("arrow")
+        if width - 6 < self._TABLE_WIDTH:
+            lines = []
+            for task, src, dst in moves:
+                lines.append([("  ", None), (task.title, "popup.text")])
+                lines.append([
+                    ("      ", None),
+                    ("%s %s %s" % (src, arrow, dst), self.theme.section_role(dst)),
+                    ("  （%s）" % schedule.reason(task, self.ctx.base), "popup.label"),
+                ])
+            return lines
+        lines = [[("  ", None), (pad("理由", 18), "popup.label"),
+                  (pad("移動", 24), "popup.label"), ("タスク", "popup.label")]]
+        for task, src, dst in moves:
+            lines.append([
+                ("  ", None),
+                (pad(schedule.reason(task, self.ctx.base), 18), "popup.text"),
+                (pad("%s %s %s" % (src, arrow, dst), 24), self.theme.section_role(dst)),
+                (task.title, "popup.text"),
+            ])
+        return lines
+
+    def _wrapped(self, text: str, role: str):
+        """モーダル本文用に、端末幅で折り返した span の並びを作る。"""
+        return [[("  ", None), (chunk, role)]
+                for chunk in util.wrap(text, self._detail_width())]
 
     def do_archive(self):
         targets = ops.archivable(self.doc)
@@ -948,6 +1021,30 @@ class App:
                 offset -= 1
             else:
                 return
+
+    def popup_ask(self, title: str, lines, hint: str) -> bool:
+        """一覧を見せたうえで y/n を聞くモーダル。y 以外は「いいえ」。
+
+        popup と違って j/k は閉じる操作ではなくスクロールに使う。
+        長い一覧を読もうとして中止してしまうのを避けるため。
+        """
+        offset = 0
+        while True:
+            height, _, _, _ = self.geometry()
+            visible = max(1, height - 8)
+            self._popup_draw(title, lines[offset:offset + visible], hint=hint)
+            try:
+                key = self.screen.get_wch()
+            except curses.error:
+                continue
+            if key in (curses.KEY_DOWN, "j"):
+                offset = min(offset + 1, max(0, len(lines) - visible))
+            elif key in (curses.KEY_UP, "k"):
+                offset = max(0, offset - 1)
+            elif key in ("y", "Y"):
+                return True
+            else:
+                return False
 
     def _popup_draw(self, title: str, lines, selected=None, hint: str | None = None):
         """中央に枠付きの箱を描く。lines は文字列か span の並び。"""
