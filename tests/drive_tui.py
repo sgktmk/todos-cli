@@ -10,6 +10,7 @@ import re
 import select
 import sys
 import time
+import unicodedata
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -83,6 +84,11 @@ def render(stream: str, cols: int = 80, rows: int = 24) -> str:
             elif cmd == "K":
                 for col in range(x, cols):
                     grid[y][col] = " "
+            elif cmd == "d":  # 行の絶対移動 (VPA)
+                y = min(rows - 1, (nums[0] - 1) if nums else 0)
+            elif cmd == "X":  # 指定桁数を空白にする (ECH)
+                for col in range(x, min(cols, x + (nums[0] if nums else 1))):
+                    grid[y][col] = " "
             elif cmd == "C":
                 x += nums[0] if nums else 1
             elif cmd == "D":
@@ -102,13 +108,14 @@ def render(stream: str, cols: int = 80, rows: int = 24) -> str:
         elif ch == "\b":
             x = max(0, x - 1)
         elif ch >= " ":
+            wide = unicodedata.east_asian_width(ch) in ("W", "F")
             if 0 <= y < rows and 0 <= x < cols:
                 grid[y][x] = ch
-            x += 1
-            import unicodedata
-
-            if unicodedata.east_asian_width(ch) in ("W", "F"):
-                x += 1
+                # 全角文字は2セルを占める。後半セルを空にしないと、
+                # 上書きしたときに前の描画が残って見える。
+                if wide and x + 1 < cols:
+                    grid[y][x + 1] = ""
+            x += 2 if wide else 1
         i += 1
     return "\n".join("".join(row).rstrip() for row in grid).rstrip()
 

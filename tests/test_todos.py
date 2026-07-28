@@ -16,7 +16,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from todos import (  # noqa: E402
-    cli, editor, model, ops, parser, render, schedule, store, tui, util, validate,
+    cli, editor, model, ops, parser, render, schedule, store, theme, tui, util, validate,
 )
 from todos import issues as iss  # noqa: E402
 
@@ -694,6 +694,117 @@ class TuiNavigationTest(unittest.TestCase):
         for width in (46, 80, 120):
             with self.subTest(width=width):
                 self.assertIn("J/K:セクション", tui.help_line(width))
+
+
+class TuiRenderTest(unittest.TestCase):
+    """curses を起動せずに、行の組み立てと配色の割り当てを検証する。"""
+
+    def make_app(self, doc, palette="mono"):
+        app = tui.App.__new__(tui.App)
+        app.ctx = type("Ctx", (), {"doc": doc, "base": TUE})()
+        app.theme = theme.Theme(palette).setup()
+        app.section_idx = 0
+        app.task_idx = 0
+        app.focus = "tasks"
+        app.filter = None
+        return app
+
+    def parse_one(self, line):
+        doc = parser.parse_text("## Today\n\n%s\n" % line, base=TUE)
+        return doc, doc.section("Today").tasks[0]
+
+    def test_task_row_keeps_title_status_due_and_tags(self):
+        doc, task = self.parse_one("- [ ] 【進行中】API を実装（〜2026/07/29） #api")
+        app = self.make_app(doc)
+        spans = app._task_spans(task, 0, selected=False)
+        text = "".join(t for t, _ in spans)
+        self.assertIn("進行中", text)
+        self.assertIn("API を実装", text)
+        self.assertIn("2026/07/29", text)
+        self.assertIn("#api", text)
+        roles = [role for _, role in spans]
+        self.assertIn("status.doing", roles)
+        self.assertIn("tag", roles)
+
+    def test_due_role_reflects_urgency(self):
+        doc, _ = self.parse_one("- [ ] 何か")
+        app = self.make_app(doc)
+        self.assertEqual(app._due_role(TUE - dt.timedelta(days=1)), "due.over")
+        self.assertEqual(app._due_role(TUE), "due.today")
+        self.assertEqual(app._due_role(TUE + dt.timedelta(days=2)), "due.soon")
+        self.assertEqual(app._due_role(TUE + dt.timedelta(days=30)), "due")
+
+    def test_ascii_theme_falls_back_to_bracket_status(self):
+        doc, task = self.parse_one("- [ ] 【完了】終わった")
+        app = self.make_app(doc)
+        app.theme = theme.Theme("mono", glyphs=False).setup()
+        text = "".join(t for t, _ in app._task_spans(task, 0, selected=False))
+        self.assertIn("【完了】", text)
+
+    def test_cell_width_is_stable_for_ambiguous_glyphs(self):
+        old = os.environ.get("TODOS_AMBIGUOUS_WIDTH")
+        try:
+            for setting in ("1", "2"):
+                os.environ["TODOS_AMBIGUOUS_WIDTH"] = setting
+                with self.subTest(ambiguous=setting):
+                    self.assertEqual(util.display_width(tui._cell("▍", 2)), 2)
+                    self.assertEqual(util.display_width(tui._cell("●", 2)), 2)
+                    self.assertEqual(util.display_width(tui._cell("あ", 2)), 2)
+        finally:
+            if old is None:
+                os.environ.pop("TODOS_AMBIGUOUS_WIDTH", None)
+            else:
+                os.environ["TODOS_AMBIGUOUS_WIDTH"] = old
+
+    def test_scroll_label(self):
+        self.assertEqual(tui._scroll_label(0, 3, 10), "全て")
+        self.assertEqual(tui._scroll_label(0, 30, 10), "先頭")
+        self.assertEqual(tui._scroll_label(20, 30, 10), "末尾")
+        self.assertEqual(tui._scroll_label(10, 30, 10), "50%")
+
+
+class ThemeTest(unittest.TestCase):
+    def with_env(self, **env):
+        old = {k: os.environ.get(k) for k in env}
+        try:
+            for k, v in env.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+            return theme.detect()
+        finally:
+            for k, v in old.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+
+    def test_no_color_disables_colors(self):
+        detected = self.with_env(NO_COLOR="1", TODOS_TUI_THEME=None)
+        self.assertEqual(detected.palette, "mono")
+
+    def test_theme_name_from_env(self):
+        self.assertEqual(self.with_env(NO_COLOR=None, TODOS_TUI_THEME="light").palette, "light")
+        self.assertEqual(self.with_env(NO_COLOR=None, TODOS_TUI_THEME="なにか").palette, "dark")
+
+    def test_glyphs_can_be_turned_off(self):
+        plain = self.with_env(NO_COLOR=None, TODOS_TUI_GLYPHS="0")
+        self.assertEqual(plain.status_glyph(model.DONE), "")
+        self.assertEqual(plain.glyph("vline"), "|")
+
+    def test_mono_setup_uses_attributes_instead_of_colors(self):
+        import curses
+
+        mono = theme.Theme("mono").setup()
+        self.assertEqual(mono.attr("cursor") & curses.A_REVERSE, curses.A_REVERSE)
+        self.assertEqual(mono.attr("title"), 0)
+
+    def test_every_role_has_a_mono_attribute(self):
+        mono = theme.Theme("mono").setup()
+        for role in theme.ROLES:
+            with self.subTest(role=role):
+                self.assertIsInstance(mono.attr(role), int)
 
 
 class UtilTest(unittest.TestCase):
