@@ -655,6 +655,33 @@ class TuiNavigationTest(unittest.TestCase):
         self.assertEqual(app.current_section().name, model.TODAY)
         self.assertIsNotNone(app.filter)
 
+    def test_reopening_shows_tasks_added_in_a_previous_session(self):
+        """TUI で追加 → 終了 → 再起動、でタスクが見えること。
+
+        「再起動すると見えないが、何か追加すると以前の分も見える」という
+        報告の再現。原因は読み込みではなくカーソル位置だった。
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            st = store.Store(Path(tmp))
+            st.init()
+
+            # セッション1: タスクを追加して保存する
+            doc = st.load(TUE)
+            ops.add(doc, "買い物", TUE)
+            st.save(doc)
+
+            # セッション2: 読み直した時点でモデルに載っていること
+            reloaded = st.load(TUE)
+            self.assertEqual([t.title for t in reloaded.all_tasks()], ["買い物"])
+            self.assertEqual(
+                [t.title for t in reloaded.section(model.PARKING_LOT).tasks], ["買い物"]
+            )
+
+            # 起動直後の画面にそのタスクが出ること
+            app = self.make_app(reloaded)
+            app.focus_first_non_empty()
+            self.assertEqual([t.title for t, _ in app.rows()], ["買い物"])
+
     def test_help_line_always_keeps_help_and_quit(self):
         for width in (20, 30, 46, 60, 78, 120, 200):
             with self.subTest(width=width):
