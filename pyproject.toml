@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "todos-cli"
+version = "0.2.0"
+description = "トドズ — Markdown を正本とする軽量タスク管理ツール"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "sgktmk" }]
+keywords = ["todo", "task", "markdown", "cli", "tui"]
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/sgktmk/todos-cli"
+
+[project.scripts]
+todos = "todos.cli:main"
+
+[tool.setuptools]
+packages = ["todos"]
