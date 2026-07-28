@@ -123,6 +123,7 @@ ROLES = {
     "due.over": ("red", None, curses.A_BOLD),
     "tag": ("lavender", None, 0),
     "badge": ("mauve", None, 0),
+    "detail.mark": ("faint", None, 0),
     "tree": ("faint", None, 0),
     "empty": ("muted", None, 0),
     # キーヘルプ
@@ -201,6 +202,7 @@ GLYPHS = {
     "tee_r": "┤",
     "section": "●",
     "due": "〜",
+    "detail": "≡",
     "tree_last": "╰",
     "tree_mid": "├",
     "corner_tl": "╭",
@@ -220,6 +222,7 @@ ASCII_GLYPHS = {
     "tee_r": "+",
     "section": "*",
     "due": "~",
+    "detail": "=",
     "tree_last": "`",
     "tree_mid": "|",
     "corner_tl": "+",

@@ -31,6 +31,7 @@ HELP_ITEMS = [
     ("x", "やらない"),
     ("m", "移動"),
     ("i", "編集"),
+    ("I", "詳細文"),
     ("/", "検索"),
     ("t", "タグ"),
     ("r", "再配置"),
@@ -76,6 +77,7 @@ HELP_KEYS = [
     ("", ""),
     ("a", "タスクを追加"),
     ("i", "タイトルを簡易編集"),
+    ("I", "詳細文を編集（外部エディタ）"),
     ("s", "ステータスを変更"),
     ("d", "完了にする"),
     ("x", "やらないにする"),
@@ -259,6 +261,8 @@ class App:
             self.add_task()
         elif key == "i":
             self.rename_task()
+        elif key == "I":
+            self.edit_detail()
         elif key == "s":
             self.change_status()
         elif key == "d":
@@ -341,6 +345,17 @@ class App:
         ops.set_title(task, title)
         self.save()
         self.notify("更新しました。")
+
+    def edit_detail(self):
+        """詳細文だけを外部エディタで編集する。TUI は複数行の入力欄を持たない。"""
+        task = self.current_task()
+        if task is None:
+            return
+        if self._outside_curses(lambda: editor.edit_detail(task)):
+            self.save()
+            self.notify("詳細文を更新しました。")
+        else:
+            self.notify("変更はありません。")
 
     def change_status(self):
         task = self.current_task()
@@ -471,7 +486,9 @@ class App:
         if task.detail:
             lines.append("")
             lines.append([("  詳細", "popup.label")])
-            lines += [[("    ", None), (line, "popup.text")] for line in task.detail]
+            for line in task.detail:
+                for chunk in util.wrap(line, self._detail_width()):
+                    lines.append([("    ", None), (chunk, "popup.text")])
         if task.children:
             lines.append("")
             lines.append([("  子タスク", "popup.label")])
@@ -483,17 +500,30 @@ class App:
                               (child.title, "popup.text")])
         self.popup(task.title, lines)
 
+    def _detail_width(self) -> int:
+        """詳細文を折り返す幅。
+
+        モーダルの内寸は _popup_draw が最長行から決めるが、上限は幅 - 6 になる。
+        そこから枠内の余白と字下げ 4 桁を引いた分までは切り詰められない。
+        """
+        _, width, _, _ = self.geometry()
+        return max(20, width - 12)
+
+    def _outside_curses(self, action):
+        """curses を一旦畳んで action を実行し、戻ってから画面を作り直す。"""
+        curses.def_prog_mode()
+        curses.endwin()
+        try:
+            return action()
+        finally:
+            curses.reset_prog_mode()
+            self.screen.clear()
+
     def external_edit(self):
         task = self.current_task()
         if task is None:
             return
-        curses.def_prog_mode()
-        curses.endwin()
-        try:
-            changed = editor.edit_task(self.doc, task)
-        finally:
-            curses.reset_prog_mode()
-            self.screen.clear()
+        changed = self._outside_curses(lambda: editor.edit_task(self.doc, task))
         if changed:
             self.save()
             self.notify("外部エディタの内容を反映しました。")
@@ -703,6 +733,9 @@ class App:
                           self._due_role(task.due)))
         for tag in task.tags:
             spans.append((" #%s" % tag, "tag"))
+        if task.detail:
+            # 詳細文は一覧に出せないので、あることだけ示して Enter へ誘導する。
+            spans.append((" %s" % t.glyph("detail"), "detail.mark"))
         return spans
 
     def _due_role(self, due) -> str:

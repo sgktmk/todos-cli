@@ -152,6 +152,44 @@ def pad(s: str, width: int) -> str:
     return s + " " * max(0, width - display_width(s))
 
 
+def wrap(s: str, width: int) -> list[str]:
+    """表示幅 width で折り返した行の一覧を返す。空文字列なら [""]。
+
+    日本語には単語境界が無いため、空白があればそこで折り、無ければ文字単位で折る。
+    """
+    if width <= 0 or display_width(s) <= width:
+        return [s]
+    out: list[str] = []
+    cur: list[str] = []
+    acc = 0
+    for ch in s:
+        w = char_width(ch)
+        if acc + w > width and cur:
+            cut = _break_at(cur)
+            head = "".join(cur[:cut]).rstrip() if cut else ""
+            if head:
+                out.append(head)
+                cur = cur[cut:]
+            else:
+                # 空白が字下げしか無い場合。空行を挟まないよう文字単位で折る。
+                out.append("".join(cur))
+                cur = []
+            acc = display_width("".join(cur))
+        cur.append(ch)
+        acc += w
+    if cur:
+        out.append("".join(cur))
+    return out
+
+
+def _break_at(chars: list[str]) -> int:
+    """最後の空白の直後の位置を返す。行頭の空白は折り返し位置にしない。"""
+    for i in range(len(chars) - 1, 0, -1):
+        if chars[i] == " ":
+            return i + 1
+    return 0
+
+
 # ---------------------------------------------------------------- 端末
 
 

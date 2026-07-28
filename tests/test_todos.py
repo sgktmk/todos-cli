@@ -588,6 +588,56 @@ class EditorTest(unittest.TestCase):
             editor.edit_task(doc, task)
         self.assertEqual([t.title for t in doc.top_tasks()], ["消さない"])
 
+    def task_with_detail(self):
+        doc = parser.parse_text(
+            "## Today\n\n"
+            "- [ ] 【進行中】残るタイトル\n"
+            "  古い詳細\n"
+            "  - [ ] 残る子\n",
+            base=TUE,
+        )
+        return doc.section("Today").tasks[0]
+
+    def test_edit_detail_replaces_only_the_detail(self):
+        task = self.task_with_detail()
+        self.fake_editor("新しい詳細\n2行目\n")
+        self.assertTrue(editor.edit_detail(task))
+        self.assertEqual(task.detail, ["新しい詳細", "2行目"])
+        # タイトル・ステータス・子タスクには触らない
+        self.assertEqual(task.title, "残るタイトル")
+        self.assertEqual(task.status, model.DOING)
+        self.assertEqual([c.title for c in task.children], ["残る子"])
+
+    def test_edit_detail_without_change_returns_false(self):
+        task = self.task_with_detail()
+        self.fake_editor("古い詳細\n")
+        self.assertFalse(editor.edit_detail(task))
+        self.assertEqual(task.detail, ["古い詳細"])
+
+    def test_edit_detail_can_clear_the_detail(self):
+        task = self.task_with_detail()
+        self.fake_editor("\n")
+        self.assertTrue(editor.edit_detail(task))
+        self.assertEqual(task.detail, [])
+
+    def test_edit_detail_rejects_bullet_lines(self):
+        task = self.task_with_detail()
+        self.fake_editor("- [ ] 子タスクのつもり\n")
+        with self.assertRaises(util.TodosError):
+            editor.edit_detail(task)
+        self.assertEqual(task.detail, ["古い詳細"])
+
+    def test_edit_detail_round_trips_through_the_file(self):
+        task = self.task_with_detail()
+        self.fake_editor("書き直した詳細\n")
+        editor.edit_detail(task)
+        doc = parser.parse_text(
+            "## Today\n\n%s\n" % "\n".join(render.render_task(task, 0)), base=TUE
+        )
+        again = doc.section("Today").tasks[0]
+        self.assertEqual(again.detail, ["書き直した詳細"])
+        self.assertEqual([c.title for c in again.children], ["残る子"])
+
 
 class TuiNavigationTest(unittest.TestCase):
     """curses を起動せずに TUI の移動ロジックだけを検証する。"""
@@ -756,6 +806,43 @@ class TuiRenderTest(unittest.TestCase):
             else:
                 os.environ["TODOS_AMBIGUOUS_WIDTH"] = old
 
+    def test_detail_marker_marks_only_tasks_with_detail(self):
+        doc = parser.parse_text(
+            "## Today\n\n- [ ] 詳細つき\n  説明\n- [ ] 詳細なし\n", base=TUE
+        )
+        app = self.make_app(doc)
+        having, lacking = doc.section("Today").tasks
+        mark = app.theme.glyph("detail")
+        self.assertIn(mark, "".join(t for t, _ in app._task_spans(having, 0, False)))
+        self.assertNotIn(mark, "".join(t for t, _ in app._task_spans(lacking, 0, False)))
+
+    def detail_modal_lines(self, doc, width):
+        app = self.make_app(doc)
+        app.geometry = lambda: (24, width, 18, width - 22)
+        captured = []
+        app.popup = lambda title, lines: captured.extend(lines)
+        app.show_detail()
+        return ["".join(t for t, _ in spans) for spans in captured
+                if not isinstance(spans, str)]
+
+    def test_detail_modal_wraps_instead_of_truncating(self):
+        body = "あ" * 60
+        doc = parser.parse_text("## Today\n\n- [ ] 長い詳細\n  %s\n" % body, base=TUE)
+        rows = [line for line in self.detail_modal_lines(doc, 80) if "あ" in line]
+        self.assertGreater(len(rows), 1)
+        for line in rows:
+            self.assertNotIn("…", line)
+            self.assertLessEqual(util.display_width(line), 80 - 6)
+        self.assertEqual("".join(line.strip() for line in rows), body)
+
+    def test_detail_modal_wraps_on_narrow_terminals(self):
+        body = "あ" * 60
+        doc = parser.parse_text("## Today\n\n- [ ] 長い詳細\n  %s\n" % body, base=TUE)
+        rows = [line for line in self.detail_modal_lines(doc, 40) if "あ" in line]
+        for line in rows:
+            self.assertLessEqual(util.display_width(line), 40 - 6)
+        self.assertEqual("".join(line.strip() for line in rows), body)
+
     def test_scroll_label(self):
         self.assertEqual(tui._scroll_label(0, 3, 10), "全て")
         self.assertEqual(tui._scroll_label(0, 30, 10), "先頭")
@@ -820,6 +907,29 @@ class UtilTest(unittest.TestCase):
         self.assertLessEqual(util.display_width(util.truncate("あいうえお", 6)), 6)
         self.assertLess(len(util.truncate("あいうえお", 6)), len("あいうえお"))
         self.assertEqual(util.truncate("あいうえお", 20), "あいうえお")
+
+    def test_wrap_keeps_every_line_within_width(self):
+        text = "あ" * 30
+        lines = util.wrap(text, 20)
+        self.assertGreater(len(lines), 1)
+        for line in lines:
+            self.assertLessEqual(util.display_width(line), 20)
+        self.assertEqual("".join(lines), text)
+
+    def test_wrap_prefers_spaces_when_present(self):
+        self.assertEqual(
+            util.wrap("alpha bravo charlie delta", 12), ["alpha bravo", "charlie", "delta"]
+        )
+
+    def test_wrap_does_not_emit_blank_lines_for_indented_text(self):
+        lines = util.wrap("    " + "あ" * 30, 20)
+        self.assertTrue(all(line.strip() for line in lines))
+        self.assertTrue(lines[0].startswith("    "))
+
+    def test_wrap_passes_short_and_empty_text_through(self):
+        self.assertEqual(util.wrap("短い", 20), ["短い"])
+        self.assertEqual(util.wrap("", 20), [""])
+        self.assertEqual(util.wrap("幅ゼロ", 0), ["幅ゼロ"])
 
     def test_ambiguous_width_is_configurable(self):
         old = os.environ.get("TODOS_AMBIGUOUS_WIDTH")
