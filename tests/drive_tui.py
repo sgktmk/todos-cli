@@ -61,21 +61,70 @@ def read_all(fd, acc: str = "") -> str:
 
 
 def render(stream: str, cols: int = 80, rows: int = 24) -> str:
-    """端末エスケープを解釈して最終画面を組み立てる（必要最小限）。"""
+    """端末エスケープを解釈して最終画面を組み立てる（必要最小限）。
+
+    curses は行がまるごとずれるとき、書き直す代わりにスクロール領域
+    (DECSTBM) と改行で画面をずらす。これを解釈しないと、モーダルの
+    スクロールなどが「最終行だけ書き換わった」ように見えてしまう。
+    """
     grid = [[" "] * cols for _ in range(rows)]
     y = x = 0
     i = 0
+    top_margin, bottom_margin = 0, rows - 1
+
+    def scroll_up(n=1):
+        for _ in range(n):
+            del grid[top_margin]
+            grid.insert(bottom_margin, [" "] * cols)
+
+    def scroll_down(n=1):
+        for _ in range(n):
+            del grid[bottom_margin]
+            grid.insert(top_margin, [" "] * cols)
+
     while i < len(stream):
         ch = stream[i]
         if ch == "\x1b":
             m = re.match(r"\x1b\[([0-9;?]*)([a-zA-Z])", stream[i:])
             if not m:
+                # ESC M（逆送り）/ ESC D（送り）/ ESC E（改行）
+                simple = re.match(r"\x1b([MDE])", stream[i:])
+                if simple:
+                    cmd = simple.group(1)
+                    if cmd == "M":
+                        scroll_down() if y == top_margin else None
+                        y = max(top_margin, y - 1)
+                    else:
+                        scroll_up() if y == bottom_margin else None
+                        y = min(bottom_margin, y + 1)
+                        if cmd == "E":
+                            x = 0
+                    i += 2
+                    continue
                 m2 = re.match(r"\x1b[()][A-Za-z0-9]", stream[i:])
                 i += len(m2.group(0)) if m2 else 1
                 continue
             params, cmd = m.group(1), m.group(2)
             nums = [int(p) for p in params.split(";") if p.isdigit()]
-            if cmd == "H":
+            if cmd == "r" and "?" not in params:  # スクロール領域 (DECSTBM)
+                top_margin = (nums[0] - 1) if nums else 0
+                bottom_margin = (nums[1] - 1) if len(nums) > 1 else rows - 1
+                top_margin = max(0, min(top_margin, rows - 1))
+                bottom_margin = max(top_margin, min(bottom_margin, rows - 1))
+                y = x = 0
+            elif cmd == "S":
+                scroll_up(nums[0] if nums else 1)
+            elif cmd == "T":
+                scroll_down(nums[0] if nums else 1)
+            elif cmd == "L":  # 行の挿入
+                for _ in range(nums[0] if nums else 1):
+                    del grid[bottom_margin]
+                    grid.insert(y, [" "] * cols)
+            elif cmd == "M":  # 行の削除
+                for _ in range(nums[0] if nums else 1):
+                    del grid[y]
+                    grid.insert(bottom_margin, [" "] * cols)
+            elif cmd == "H":
                 y = (nums[0] - 1) if nums else 0
                 x = (nums[1] - 1) if len(nums) > 1 else 0
             elif cmd == "J":
@@ -104,7 +153,11 @@ def render(stream: str, cols: int = 80, rows: int = 24) -> str:
         if ch == "\r":
             x = 0
         elif ch == "\n":
-            y, x = min(y + 1, rows - 1), 0
+            if y == bottom_margin:
+                scroll_up()
+            else:
+                y = min(y + 1, rows - 1)
+            x = 0
         elif ch == "\b":
             x = max(0, x - 1)
         elif ch >= " ":

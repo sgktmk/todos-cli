@@ -64,6 +64,80 @@ def add(
     return task
 
 
+def duplicate(doc: Document, task: Task) -> Task:
+    """タスク行だけを複製し、元のすぐ下に置く。
+
+    複製するのは Markdown の「タスク行」に書かれているもの
+    （タイトル・ステータス・相手・期日・タグ）だけ。詳細文と子タスクは
+    引き継がない。大部分が同じで一部だけ違うタスクを続けて作るための機能で、
+    引き継いだ本文を毎回消すほうが手間になるため。
+    """
+    copy = Task(
+        title=task.title,
+        status=task.status,
+        counterpart=task.counterpart,
+        due=task.due,
+        tags=list(task.tags),
+    )
+    copy.status_explicit = task.status_explicit
+    copy.bullet = task.bullet
+    _sync_marks(copy)
+
+    if task.parent is not None:
+        siblings = task.parent.children
+        siblings.insert(siblings.index(task) + 1, copy)
+        copy.parent = task.parent
+        copy.section = task.parent.section
+        doc.reindex()
+        return copy
+
+    section = doc.section(task.section) if task.section else None
+    if section is None:
+        raise TodosError("複製元のセクションが見つかりません。")
+    section.nodes.insert(section.nodes.index(task) + 1, copy)
+    copy.section = task.section
+    doc.reindex()
+    return copy
+
+
+# ---------------------------------------------------------------- 並べ替え
+
+
+def reorder(doc: Document, task: Task, delta: int) -> bool:
+    """タスクを兄弟の中で上下に入れ替える。動かせたら True。
+
+    子タスクは親の子の中で、トップレベルはセクションの中で入れ替える。
+    別の親やセクションへは移らない（セクション移動は schedule.move）。
+    タスク以外の行（本文など）は位置を変えない。
+    """
+    if delta == 0:
+        return False
+    if task.parent is not None:
+        siblings = task.parent.children
+        index = siblings.index(task) + delta
+        if not 0 <= index < len(siblings):
+            return False
+        siblings.remove(task)
+        siblings.insert(index, task)
+        doc.reindex()
+        return True
+
+    section = doc.section(task.section) if task.section else None
+    if section is None:
+        return False
+    tasks = section.tasks
+    index = tasks.index(task) + delta
+    if not 0 <= index < len(tasks):
+        return False
+    # nodes には本文などタスク以外の行も混ざるため、入れ替えるのは
+    # 相手のタスクが占めていた位置だけにする。
+    here = section.nodes.index(task)
+    there = section.nodes.index(tasks[index])
+    section.nodes[here], section.nodes[there] = section.nodes[there], section.nodes[here]
+    doc.reindex()
+    return True
+
+
 # ---------------------------------------------------------------- 更新
 
 

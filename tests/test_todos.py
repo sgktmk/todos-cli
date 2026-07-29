@@ -4,6 +4,7 @@
 実行: python3 -m unittest discover -s tests
 """
 
+import curses
 import datetime as dt
 import io
 import os
@@ -187,6 +188,43 @@ class ScheduleTest(unittest.TestCase):
             self.place(status=model.HOLD, due=dt.date(2026, 7, 29)), model.TODAY
         )
 
+    def test_section_due_is_the_inverse_of_placement(self):
+        for section in model.SECTIONS:
+            with self.subTest(section=section):
+                due = schedule.section_due(section, TUE)
+                if due is None:
+                    continue
+                self.assertEqual(self.place(due=due), section)
+
+    def test_section_due_covers_only_date_driven_sections(self):
+        self.assertEqual(schedule.section_due(model.TODAY, TUE), TUE)
+        self.assertEqual(schedule.section_due(model.TOMORROW, TUE),
+                         dt.date(2026, 7, 30))
+        self.assertEqual(schedule.section_due(model.IN_WEEK, TUE),
+                         dt.date(2026, 7, 31))  # 当週の金曜（日曜ではなく稼働日の終わり）
+        self.assertIsNone(schedule.section_due(model.OPEN_ENDED, TUE))
+        self.assertIsNone(schedule.section_due(model.PARKING_LOT, TUE))
+
+    def test_section_due_for_in_week_is_always_a_friday(self):
+        monday = dt.date(2026, 7, 27)
+        for base, expected in ((monday, dt.date(2026, 7, 31)), (TUE, dt.date(2026, 7, 31))):
+            with self.subTest(base=base):
+                due = schedule.section_due(model.IN_WEEK, base)
+                self.assertEqual(due, expected)
+                self.assertEqual(due.weekday(), 4)  # 金曜
+                self.assertEqual(schedule.desired_section(
+                    model.Task(title="x", due=due), base), model.IN_WEEK)
+
+    def test_section_due_gives_up_when_no_weekday_is_left_in_the_week(self):
+        # 水曜以降は当週の金曜が Today / Tomorrow の範囲に入る（または過ぎている）
+        for base in (dt.date(2026, 7, 29),   # 水
+                     dt.date(2026, 7, 30),   # 木
+                     dt.date(2026, 7, 31),   # 金
+                     dt.date(2026, 8, 1),    # 土
+                     dt.date(2026, 8, 2)):   # 日
+            with self.subTest(base=base):
+                self.assertIsNone(schedule.section_due(model.IN_WEEK, base))
+
     def reason(self, **kwargs):
         return schedule.reason(model.Task(title="x", **kwargs), TUE)
 
@@ -357,6 +395,108 @@ class OpsTest(unittest.TestCase):
         self.assertEqual([t.title for t in ops.search(doc, tag="backend")], ["API実装"])
         self.assertEqual(len(ops.search(doc, keyword="backend")), 1)
         self.assertEqual(len(ops.search(doc, keyword="実装")), 2)
+
+    # ------------------------------------------------------------ 並べ替え
+
+    def test_reorder_moves_a_task_within_its_section(self):
+        doc = self.make_doc()
+        for title in ("1件目", "2件目", "3件目"):
+            ops.add(doc, title, TUE, section=model.TODAY)
+        second = doc.section(model.TODAY).tasks[1]
+        self.assertTrue(ops.reorder(doc, second, -1))
+        self.assertEqual([t.title for t in doc.section(model.TODAY).tasks],
+                         ["2件目", "1件目", "3件目"])
+        self.assertTrue(ops.reorder(doc, second, 1))
+        self.assertEqual([t.title for t in doc.section(model.TODAY).tasks],
+                         ["1件目", "2件目", "3件目"])
+
+    def test_reorder_stops_at_the_ends(self):
+        doc = self.make_doc()
+        first = ops.add(doc, "1件目", TUE, section=model.TODAY)
+        ops.add(doc, "2件目", TUE, section=model.TODAY)
+        self.assertFalse(ops.reorder(doc, first, -1))
+        self.assertEqual([t.title for t in doc.section(model.TODAY).tasks],
+                         ["1件目", "2件目"])
+
+    def test_reorder_keeps_children_under_their_parent(self):
+        doc = self.make_doc()
+        parent = ops.add(doc, "親", TUE, section=model.TODAY)
+        ops.add(doc, "子1", TUE, parent=parent)
+        second = ops.add(doc, "子2", TUE, parent=parent)
+        other = ops.add(doc, "別の親", TUE, section=model.TODAY)
+        self.assertTrue(ops.reorder(doc, second, -1))
+        self.assertEqual([c.title for c in parent.children], ["子2", "子1"])
+        # 兄弟の外へは出ない
+        self.assertFalse(ops.reorder(doc, second, -1))
+        self.assertEqual(len(other.children), 0)
+
+    def test_reorder_survives_a_round_trip(self):
+        doc = self.make_doc()
+        ops.add(doc, "1件目", TUE, section=model.TODAY)
+        second = ops.add(doc, "2件目", TUE, section=model.TODAY)
+        ops.reorder(doc, second, -1)
+        again = parser.parse_text(render.render_document(doc), base=TUE)
+        self.assertEqual([t.title for t in again.section(model.TODAY).tasks],
+                         ["2件目", "1件目"])
+
+    def test_reorder_leaves_other_lines_in_place(self):
+        doc = parser.parse_text(
+            "## Today\n\n覚え書き\n\n- [ ] 1件目\n- [ ] 2件目\n", base=TUE
+        )
+        second = doc.section(model.TODAY).tasks[1]
+        ops.reorder(doc, second, -1)
+        text = render.render_document(doc)
+        self.assertLess(text.index("覚え書き"), text.index("2件目"))
+
+    # ------------------------------------------------------------ 複製
+
+    def test_duplicate_copies_the_task_line_only(self):
+        doc = self.make_doc()
+        task = ops.add(doc, "日報を書く", TUE, status=model.WAITING,
+                       counterpart="山田", due=dt.date(2026, 7, 28),
+                       tags=["work"], detail="ひな形は共有ドライブ")
+        ops.add(doc, "子", TUE, parent=task)
+        copy = ops.duplicate(doc, task)
+        self.assertEqual(copy.title, task.title)
+        self.assertEqual(copy.status, model.WAITING)
+        self.assertEqual(copy.counterpart, "山田")
+        self.assertEqual(copy.due, dt.date(2026, 7, 28))
+        self.assertEqual(copy.tags, ["work"])
+        # 詳細文と子タスクは引き継がない
+        self.assertEqual(copy.detail, [])
+        self.assertEqual(copy.children, [])
+        self.assertIsNot(copy.tags, task.tags)
+
+    def test_duplicate_lands_right_below_the_original(self):
+        doc = self.make_doc()
+        for title in ("1件目", "2件目"):
+            ops.add(doc, title, TUE, section=model.TODAY)
+        first = doc.section(model.TODAY).tasks[0]
+        ops.duplicate(doc, first)
+        self.assertEqual([t.title for t in doc.section(model.TODAY).tasks],
+                         ["1件目", "1件目", "2件目"])
+
+    def test_duplicate_of_a_child_stays_a_child(self):
+        doc = self.make_doc()
+        parent = ops.add(doc, "親", TUE, section=model.TODAY)
+        child = ops.add(doc, "子", TUE, parent=parent)
+        copy = ops.duplicate(doc, child)
+        self.assertIs(copy.parent, parent)
+        self.assertEqual([c.title for c in parent.children], ["子", "子"])
+        self.assertEqual(copy.section, model.TODAY)
+
+    def test_duplicate_survives_a_round_trip(self):
+        doc = self.make_doc()
+        task = ops.add(doc, "返事を書く", TUE, status=model.WAITING,
+                       counterpart="山田", tags=["work"])
+        ops.duplicate(doc, task)
+        again = parser.parse_text(render.render_document(doc), base=TUE)
+        copies = [t for t in again.all_tasks() if t.title == "返事を書く"]
+        self.assertEqual(len(copies), 2)
+        for copy in copies:
+            self.assertEqual(copy.status, model.WAITING)
+            self.assertEqual(copy.counterpart, "山田")
+            self.assertEqual(copy.tags, ["work"])
 
     def test_report_groups_by_status(self):
         doc = self.make_doc()
@@ -783,6 +923,112 @@ class TuiEditTest(unittest.TestCase):
         it = iter(values)
         app.prompt = lambda label, initial="": next(it)
 
+    def select_section(self, app, name):
+        app.section_idx = [s.name for s in app.sections()].index(name)
+        app.task_idx = 0
+
+    # ------------------------------------------------------------ 追加
+
+    def test_add_in_today_offers_the_section_due(self):
+        app, doc = self.make_app("## Today\n")
+        self.select_section(app, model.TODAY)
+        self.answer(app, "資料をまとめる")
+        asked = []
+        app.ask = lambda question: asked.append(question) or True
+        app.add_task()
+        task = doc.section(model.TODAY).tasks[0]
+        self.assertEqual(task.due, TUE)
+        self.assertIn("2026/07/28", asked[0])
+        self.assertIn("本日", asked[0])
+        self.assertEqual(app.saved, 1)
+
+    def test_add_in_tomorrow_offers_the_date_that_keeps_it_there(self):
+        app, doc = self.make_app("## Tomorrow\n")
+        self.select_section(app, model.TOMORROW)
+        self.answer(app, "明日やる")
+        app.ask = lambda question: True
+        app.add_task()
+        task = doc.section(model.TOMORROW).tasks[0]
+        self.assertEqual(task.due, dt.date(2026, 7, 30))
+
+    def test_add_in_in_week_offers_the_friday(self):
+        app, doc = self.make_app("## InWeek\n")
+        self.select_section(app, model.IN_WEEK)
+        self.answer(app, "今週中にやる")
+        asked = []
+        app.ask = lambda question: asked.append(question) or True
+        app.add_task()
+        task = doc.section(model.IN_WEEK).tasks[0]
+        self.assertEqual(task.due, dt.date(2026, 7, 31))
+        self.assertIn("金曜", asked[0])
+
+    def test_add_without_the_due_keeps_the_old_behaviour(self):
+        app, doc = self.make_app("## Today\n")
+        self.select_section(app, model.TODAY)
+        self.answer(app, "期日は要らない")
+        app.ask = lambda question: False
+        app.add_task()
+        task = doc.section(model.PARKING_LOT).tasks[0]
+        self.assertIsNone(task.due)
+
+    def test_add_does_not_ask_in_sections_without_a_date(self):
+        for name in (model.OPEN_ENDED, model.PARKING_LOT):
+            with self.subTest(section=name):
+                app, doc = self.make_app("## %s\n" % name)
+                self.select_section(app, name)
+                self.answer(app, "いつかやる")
+                app.ask = lambda question: self.fail("期日を聞かないこと")
+                app.add_task()
+                self.assertIsNone(doc.all_tasks()[0].due)
+
+    def test_add_does_not_ask_while_searching(self):
+        app, doc = self.make_app("## Today\n\n- [ ] 既存（〜2026/07/28）\n")
+        self.select_section(app, model.TODAY)
+        app.filter = ("keyword", "既存")
+        self.answer(app, "検索中に追加")
+        app.ask = lambda question: self.fail("検索結果からは聞かないこと")
+        app.add_task()
+        self.assertIsNone(doc.section(model.PARKING_LOT).tasks[0].due)
+
+    # ------------------------------------------------------------ 並べ替え・複製
+
+    def test_reorder_moves_the_selected_task_and_follows_it(self):
+        app, doc = self.make_app("## Today\n\n- [ ] 1件目\n- [ ] 2件目\n")
+        app.task_idx = 1
+        second = app.current_task()
+        app.reorder(-1)
+        self.assertEqual([t.title for t in doc.section(model.TODAY).tasks],
+                         ["2件目", "1件目"])
+        self.assertIs(app.current_task(), second)  # カーソルは動かしたタスクに残る
+        self.assertEqual(app.saved, 1)
+
+    def test_reorder_at_the_end_saves_nothing(self):
+        app, _ = self.make_app("## Today\n\n- [ ] 1件目\n- [ ] 2件目\n")
+        app.reorder(-1)
+        self.assertEqual(app.saved, 0)
+        self.assertIn("動かせません", app.message)
+
+    def test_reorder_is_refused_while_searching(self):
+        app, doc = self.make_app("## Today\n\n- [ ] 1件目\n- [ ] 2件目\n")
+        app.filter = ("keyword", "件目")
+        app.task_idx = 1
+        app.reorder(-1)
+        self.assertEqual([t.title for t in doc.section(model.TODAY).tasks],
+                         ["1件目", "2件目"])
+        self.assertEqual(app.saved, 0)
+
+    def test_duplicate_selects_the_copy(self):
+        app, doc = self.make_app("## Today\n\n- [ ] ひな形（〜2026/07/28）\n  詳細文\n")
+        original = app.current_task()
+        app.duplicate_task()
+        tasks = doc.section(model.TODAY).tasks
+        self.assertEqual([t.title for t in tasks], ["ひな形", "ひな形"])
+        self.assertIs(app.current_task(), tasks[1])
+        self.assertIsNot(app.current_task(), original)
+        self.assertEqual(tasks[1].due, dt.date(2026, 7, 28))
+        self.assertEqual(tasks[1].detail, [])
+        self.assertEqual(app.saved, 1)
+
     # ------------------------------------------------------------ 期日
 
     def test_edit_due_sets_and_follows_the_rule(self):
@@ -936,6 +1182,72 @@ class TuiEditTest(unittest.TestCase):
         self.assertIn("警告", shown["title"])
 
 
+class TuiPromptTest(unittest.TestCase):
+    """入力欄の行編集。curses は起動せず、キー入力だけを流す。"""
+
+    def make_app(self, keys):
+        app = tui.App.__new__(tui.App)
+        app.theme = theme.Theme("mono").setup()
+        app.geometry = lambda: (24, 40, 10, 26)
+        it = iter(keys)
+        app.screen = type("S", (), {
+            "get_wch": staticmethod(lambda: next(it)),
+            "move": staticmethod(lambda y, x: None),
+            "refresh": staticmethod(lambda: None),
+        })()
+        app._draw_spans = lambda *a, **k: None
+        # curses を初期化していないので、カーソルの表示切り替えだけ黙らせる
+        original = tui.curses.curs_set
+        tui.curses.curs_set = lambda n: None
+        self.addCleanup(setattr, tui.curses, "curs_set", original)
+        return app
+
+    def type(self, initial, keys):
+        keys = list(keys) + ["\n"]
+        return self.make_app(keys).prompt("追加", initial)
+
+    def test_left_and_right_move_the_cursor(self):
+        # 「ABC」の B の前へ戻って X を入れる
+        keys = [curses.KEY_LEFT, curses.KEY_LEFT, "X", curses.KEY_RIGHT, "Y"]
+        self.assertEqual(self.type("ABC", keys), "AXBYC")
+
+    def test_backspace_deletes_before_the_cursor(self):
+        self.assertEqual(self.type("ABC", [curses.KEY_LEFT, "\x7f"]), "AC")
+
+    def test_delete_removes_the_character_under_the_cursor(self):
+        keys = [curses.KEY_HOME, curses.KEY_DC]
+        self.assertEqual(self.type("ABC", keys), "BC")
+
+    def test_home_and_end_jump_to_both_ends(self):
+        keys = [curses.KEY_HOME, "1", curses.KEY_END, "9"]
+        self.assertEqual(self.type("ABC", keys), "1ABC9")
+
+    def test_control_keys_cut_around_the_cursor(self):
+        self.assertEqual(self.type("ABCDE", [curses.KEY_LEFT, "\x15"]), "E")
+        self.assertEqual(self.type("ABCDE", [curses.KEY_LEFT, "\x0b"]), "ABCD")
+        self.assertEqual(self.type("会議の 準備 メモ", ["\x17"]), "会議の 準備")
+
+    def test_editing_works_on_full_width_text(self):
+        keys = [curses.KEY_LEFT, "の"]
+        self.assertEqual(self.type("会議準備", keys), "会議準の備")
+
+    def test_escape_cancels_even_after_editing(self):
+        app = self.make_app([curses.KEY_HOME, "X", "\x1b"])
+        self.assertIsNone(app.prompt("追加", "ABC"))
+
+    def test_unknown_keys_are_ignored(self):
+        self.assertEqual(self.type("ABC", [curses.KEY_F1, "D"]), "ABCD")
+
+    def test_view_follows_the_cursor_in_a_narrow_field(self):
+        buf = list("あいうえおかきくけこ")  # 表示幅 20
+        # 幅 10 の欄では左が隠れる。末尾のカーソルにも 1 桁要るので 4 文字分だけ残す
+        self.assertEqual(tui._input_view(buf, len(buf), 0, 10), 6)
+        # 行頭へ戻せば左端から見せる
+        self.assertEqual(tui._input_view(buf, 0, 5, 10), 0)
+        # 全部収まるなら送らない
+        self.assertEqual(tui._input_view(buf, len(buf), 3, 40), 0)
+
+
 class TuiNavigationTest(unittest.TestCase):
     """curses を起動せずに TUI の移動ロジックだけを検証する。"""
 
@@ -976,13 +1288,13 @@ class TuiNavigationTest(unittest.TestCase):
         app.focus_first_non_empty()
         self.assertEqual(app.current_section().name, model.TODAY)
 
-    def test_j_moves_section_when_current_section_is_empty(self):
+    def test_j_stays_in_the_section_when_it_is_empty(self):
         app = self.make_app(self.doc_with_task_in(model.PARKING_LOT))
         self.assertEqual(app.current_section().name, model.TODAY)
         for _ in range(4):
             app.move_cursor(1, len(app.rows()))
-        self.assertEqual(app.current_section().name, model.PARKING_LOT)
-        self.assertEqual(len(app.rows()), 1)
+        # j/k はセクションをまたがない（移動は J/K か Tab）
+        self.assertEqual(app.current_section().name, model.TODAY)
 
     def test_j_moves_task_when_section_has_tasks(self):
         doc = parser.parse_text("", base=TUE)
@@ -993,6 +1305,45 @@ class TuiNavigationTest(unittest.TestCase):
         app.move_cursor(1, len(app.rows()))
         self.assertEqual(app.current_section().name, model.TODAY)
         self.assertEqual(app.current_task().title, "2件目")
+
+    def test_j_loops_inside_the_section(self):
+        doc = parser.parse_text("", base=TUE)
+        doc.ensure_sections()
+        ops.add(doc, "1件目", TUE, section=model.TODAY)
+        ops.add(doc, "2件目", TUE, section=model.TODAY)
+        app = self.make_app(doc)
+        for _ in range(2):  # 末尾のさらに下は先頭へ戻る
+            app.move_cursor(1, len(app.rows()))
+        self.assertEqual(app.current_section().name, model.TODAY)
+        self.assertEqual(app.current_task().title, "1件目")
+        app.move_cursor(-1, len(app.rows()))  # 先頭のさらに上は末尾へ
+        self.assertEqual(app.current_task().title, "2件目")
+
+    def test_section_move_wraps_around(self):
+        app = self.make_app(self.doc_with_task_in(model.PARKING_LOT))
+        last = len(app.sections()) - 1
+        app.change_section(-1)
+        self.assertEqual(app.section_idx, last)
+        app.change_section(1)
+        self.assertEqual(app.section_idx, 0)
+
+    def test_pane_switching_is_tab_only(self):
+        app = self.make_app(self.doc_with_task_in(model.TODAY))
+        app.quit = False
+        for key in ("h", "l"):  # 昔の割り当ては効かない
+            app.handle(key)
+            self.assertEqual(app.focus, "tasks")
+        app.handle("\t")
+        self.assertEqual(app.focus, "sections")
+        app.handle("\t")
+        self.assertEqual(app.focus, "tasks")
+
+    def test_enter_in_the_sections_pane_moves_to_the_tasks_pane(self):
+        app = self.make_app(self.doc_with_task_in(model.TODAY))
+        app.quit = False
+        app.focus = "sections"
+        app.handle("\n")  # 詳細モーダルではなく Tasks ペインへ
+        self.assertEqual(app.focus, "tasks")
 
     def test_empty_search_result_does_not_move_section(self):
         app = self.make_app(self.doc_with_task_in(model.PARKING_LOT))
@@ -1118,15 +1469,62 @@ class TuiRenderTest(unittest.TestCase):
                 self.stub_keys(app, keys)
                 self.assertEqual(app.popup_ask("t", [["x"]], "hint"), expected)
 
+    def stub_popup_draw(self, app, heads):
+        """描画の代わりに、いま先頭に見えている行を記録する。"""
+        app._popup_draw = lambda title, lines, offset=0, selected=None, hint=None: \
+            heads.append(lines[offset][0][0])
+
     def test_popup_ask_scrolls_without_closing(self):
         app = self.make_app(parser.parse_text("## Today\n", base=TUE))
         app.geometry = lambda: (20, 80, 18, 58)
         heads = []
-        app._popup_draw = lambda title, lines, hint=None: heads.append(lines[0][0][0])
+        self.stub_popup_draw(app, heads)
         self.stub_keys(app, ["j", "j", "k", "y"])
         lines = [[("行%d" % i, None)] for i in range(30)]
         self.assertTrue(app.popup_ask("t", lines, "hint"))
         self.assertEqual(heads, ["行0", "行1", "行2", "行1"])
+
+    def test_popup_scrolls_without_closing_at_either_end(self):
+        """詳細を読み進めた勢いでモーダルが閉じないこと。"""
+        app = self.make_app(parser.parse_text("## Today\n", base=TUE))
+        app.geometry = lambda: (20, 80, 18, 58)  # 本文は 12 行ぶん見える
+        heads = []
+        self.stub_popup_draw(app, heads)
+        lines = [[("行%d" % i, None)] for i in range(14)]
+        # 末尾まで送っても、先頭で戻しても閉じない。閉じるのは他のキー。
+        self.stub_keys(app, ["j", "j", "j", "k", "k", "k", "\x1b"])
+        app.popup("t", lines)
+        self.assertEqual(heads, ["行0", "行1", "行2", "行2", "行1", "行0", "行0"])
+
+    def test_popup_keeps_its_width_while_scrolling(self):
+        """スクロールで箱の幅が変わらないこと（幅は全行から決める）。"""
+        app = self.make_app(parser.parse_text("## Today\n", base=TUE))
+        app.geometry = lambda: (20, 80, 18, 58)
+        app.screen = type("S", (), {"refresh": staticmethod(lambda: None)})()
+        app._draw_spans = lambda *a, **k: None
+        drawn = []
+        app._addstr = lambda y, x, text, attr=0: drawn.append(text)
+        lines = [[("短い", None)]] + [[("あ" * 20, None)] for _ in range(20)]
+        widths = []
+        for offset in (0, 1, 5):
+            drawn.clear()
+            app._popup_draw("t", lines, offset=offset, hint="hint")
+            widths.append(util.display_width(drawn[0]))  # 最初に描くのは上枠
+        self.assertEqual(len(set(widths)), 1)
+
+    def test_popup_highlights_the_selected_row_after_scrolling(self):
+        """窓をずらしても、帯が付くのは選択中の行だけであること。"""
+        app = self.make_app(parser.parse_text("## Today\n", base=TUE))
+        app.geometry = lambda: (13, 60, 18, 38)
+        app.screen = type("S", (), {"refresh": staticmethod(lambda: None)})()
+        app._addstr = lambda y, x, text, attr=0: None
+        rows = []
+        app._draw_spans = lambda y, x, spans, w, fill_role=None, base=None: rows.append(
+            ("".join(t for t, _ in spans), base is not None))
+        lines = [[("項目%d" % i, None)] for i in range(7)]
+        app._popup_draw("t", lines, offset=2, selected=6, hint="hint")
+        banded = [text for text, highlighted in rows if highlighted]
+        self.assertEqual(banded, [" t", "項目6"])  # タイトル帯と選択行だけ
 
     def test_move_table_shows_reason_and_destination(self):
         doc = parser.parse_text(
