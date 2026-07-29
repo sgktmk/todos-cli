@@ -201,14 +201,29 @@ class ScheduleTest(unittest.TestCase):
         self.assertEqual(schedule.section_due(model.TOMORROW, TUE),
                          dt.date(2026, 7, 30))
         self.assertEqual(schedule.section_due(model.IN_WEEK, TUE),
-                         dt.date(2026, 8, 2))  # 当週の日曜
+                         dt.date(2026, 7, 31))  # 当週の金曜（日曜ではなく稼働日の終わり）
         self.assertIsNone(schedule.section_due(model.OPEN_ENDED, TUE))
         self.assertIsNone(schedule.section_due(model.PARKING_LOT, TUE))
 
-    def test_section_due_gives_up_when_the_week_is_almost_over(self):
-        # 金曜。当週日曜は明後日なので、InWeek に留まる期日が無い
-        friday = dt.date(2026, 7, 31)
-        self.assertIsNone(schedule.section_due(model.IN_WEEK, friday))
+    def test_section_due_for_in_week_is_always_a_friday(self):
+        monday = dt.date(2026, 7, 27)
+        for base, expected in ((monday, dt.date(2026, 7, 31)), (TUE, dt.date(2026, 7, 31))):
+            with self.subTest(base=base):
+                due = schedule.section_due(model.IN_WEEK, base)
+                self.assertEqual(due, expected)
+                self.assertEqual(due.weekday(), 4)  # 金曜
+                self.assertEqual(schedule.desired_section(
+                    model.Task(title="x", due=due), base), model.IN_WEEK)
+
+    def test_section_due_gives_up_when_no_weekday_is_left_in_the_week(self):
+        # 水曜以降は当週の金曜が Today / Tomorrow の範囲に入る（または過ぎている）
+        for base in (dt.date(2026, 7, 29),   # 水
+                     dt.date(2026, 7, 30),   # 木
+                     dt.date(2026, 7, 31),   # 金
+                     dt.date(2026, 8, 1),    # 土
+                     dt.date(2026, 8, 2)):   # 日
+            with self.subTest(base=base):
+                self.assertIsNone(schedule.section_due(model.IN_WEEK, base))
 
     def reason(self, **kwargs):
         return schedule.reason(model.Task(title="x", **kwargs), TUE)
@@ -935,6 +950,17 @@ class TuiEditTest(unittest.TestCase):
         app.add_task()
         task = doc.section(model.TOMORROW).tasks[0]
         self.assertEqual(task.due, dt.date(2026, 7, 30))
+
+    def test_add_in_in_week_offers_the_friday(self):
+        app, doc = self.make_app("## InWeek\n")
+        self.select_section(app, model.IN_WEEK)
+        self.answer(app, "今週中にやる")
+        asked = []
+        app.ask = lambda question: asked.append(question) or True
+        app.add_task()
+        task = doc.section(model.IN_WEEK).tasks[0]
+        self.assertEqual(task.due, dt.date(2026, 7, 31))
+        self.assertIn("金曜", asked[0])
 
     def test_add_without_the_due_keeps_the_old_behaviour(self):
         app, doc = self.make_app("## Today\n")

@@ -42,6 +42,7 @@ def section_due(section: str, base: _dt.date) -> _dt.date | None:
     Today / Tomorrow などを見ているときに作るタスクは「そのタイミングで
     やりたいもの」なので、期日の候補を提示するために使う。
     期日で決まらないセクション（OpenEnded・ParkingLot）は None。
+    InWeek は週の区切り（日曜）ではなく、稼働日の終わりである金曜を返す。
 
     返した日付を持つタスクは desired_section が同じセクションを指す。
     """
@@ -50,9 +51,10 @@ def section_due(section: str, base: _dt.date) -> _dt.date | None:
     if section == model.TOMORROW:
         return base + _dt.timedelta(days=2)
     if section == model.IN_WEEK:
-        due = util.week_end(base)
-        # 週末が近いと当週日曜が Today / Tomorrow の範囲に入る。
-        # そのときは InWeek に留まる期日が存在しない。
+        # 週の区切りは日曜だが、稼働日として最後になるのは金曜なので金曜を出す。
+        due = util.week_end(base) - _dt.timedelta(days=2)
+        # 週の後半は当週の金曜が Today / Tomorrow の範囲に入る（または過ぎている）。
+        # そのときは InWeek に留まる稼働日が無いので提案しない。
         return due if due > base + _dt.timedelta(days=2) else None
     return None
 
