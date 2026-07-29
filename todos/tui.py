@@ -24,12 +24,15 @@ WEEKDAYS = ("月", "火", "水", "木", "金", "土", "日")
 HELP_ITEMS = [
     ("j/k", "移動"),
     ("J/K", "セクション"),
+    ("Tab", "ペイン"),
     ("Enter", "詳細"),
     ("a", "追加"),
     ("s", "状態"),
     ("d", "完了"),
     ("x", "やらない"),
     ("m", "移動"),
+    ("[/]", "並べ替え"),
+    ("c", "複製"),
     ("i", "編集"),
     ("D", "期日"),
     ("T", "タグ"),
@@ -70,16 +73,16 @@ def help_line(width: int) -> str:
 
 #: ヘルプモーダルの内容。("", "") は区切りの空行。
 HELP_KEYS = [
-    ("j / ↓", "次のタスクへ（空のセクションでは次のセクションへ）"),
-    ("k / ↑", "前のタスクへ（空のセクションでは前のセクションへ）"),
-    ("J / K", "次 / 前のセクションへ"),
+    ("j / ↓", "次のタスクへ（末尾まで来たら先頭に戻る）"),
+    ("k / ↑", "前のタスクへ（先頭まで来たら末尾に戻る）"),
+    ("J / K", "次 / 前のセクションへ（端まで来たら反対側へ回る）"),
     ("g / G", "先頭 / 末尾へ"),
-    ("h / l", "セクションペインへ / タスクペインへ"),
-    ("Tab", "ペインを切り替える"),
-    ("Enter", "タスクの詳細を表示"),
+    ("Tab", "Sections ペインと Tasks ペインを切り替える"),
+    ("Enter", "タスクの詳細を表示（Sections では Tasks へ移る）"),
     ("", ""),
-    ("a", "タスクを追加"),
+    ("a", "タスクを追加（Today などでは期日を入れるか聞く）"),
     ("o", "選択中のタスクの子として追加"),
+    ("c", "タスク行を複製（詳細文・子タスクは複製しない）"),
     ("i", "タイトルを簡易編集"),
     ("I", "詳細文を編集（外部エディタ）"),
     ("D", "期日を設定・削除（空欄で削除）"),
@@ -88,6 +91,7 @@ HELP_KEYS = [
     ("d", "完了にする"),
     ("x", "やらないにする"),
     ("m", "セクションを移動"),
+    ("[ / ]", "兄弟の中で上へ / 下へ動かす（Shift + ↑ / ↓ も可）"),
     ("e", "外部エディタで編集"),
     ("", ""),
     ("/", "キーワード検索"),
@@ -236,12 +240,13 @@ class App:
         if key == curses.KEY_RESIZE:
             return
         if isinstance(key, int):
+            # ← / → は割り当てない。ペインの行き来は Tab だけにする。
             mapping = {
                 curses.KEY_DOWN: "j",
                 curses.KEY_UP: "k",
-                curses.KEY_LEFT: "h",
-                curses.KEY_RIGHT: "l",
                 curses.KEY_ENTER: "\n",
+                curses.KEY_SR: "[",   # Shift + ↑
+                curses.KEY_SF: "]",   # Shift + ↓
             }
             key = mapping.get(key, "")
         if key in ("q",):
@@ -256,16 +261,16 @@ class App:
             self.set_cursor(max(0, len(rows) - 1))
         elif key == "\t":
             self.focus = "sections" if self.focus == "tasks" else "tasks"
-        elif key == "h":
-            self.focus = "sections"
-        elif key == "l":
-            self.focus = "tasks"
         elif key == "J":
             self.change_section(1)
         elif key == "K":
             self.change_section(-1)
         elif key in ("\n", "\r", curses.KEY_ENTER):
-            self.show_detail()
+            # Sections ペインでは「このセクションを見る」を決定とみなす。
+            if self.focus == "sections":
+                self.focus = "tasks"
+            else:
+                self.show_detail()
         elif key == "a":
             self.add_task()
         elif key == "o":
@@ -286,6 +291,12 @@ class App:
             self.terminal_status(model.SKIP)
         elif key == "m":
             self.move_task()
+        elif key == "[":
+            self.reorder(-1)
+        elif key == "]":
+            self.reorder(1)
+        elif key == "c":
+            self.duplicate_task()
         elif key == "/":
             self.start_search("keyword")
         elif key == "t":
@@ -312,15 +323,16 @@ class App:
     # ------------------------------------------------------------ カーソル
 
     def move_cursor(self, delta: int, total: int):
+        """j/k の移動。いま見ている一覧の中だけで循環する。
+
+        末尾で次のセクションへ抜けると、どこにいるのかを見失うため
+        セクションをまたがない。セクションの移動は J/K か Tab に任せる。
+        """
         if self.focus == "sections":
             self.change_section(delta)
             return
         if total:
-            self.task_idx = max(0, min(self.task_idx + delta, total - 1))
-        elif not self.filter:
-            # 空のセクションで j/k が無反応だと行き止まりに見えるため、
-            # そのままセクション移動として扱う。
-            self.change_section(delta)
+            self.task_idx = (self.task_idx + delta) % total
 
     def set_cursor(self, index: int):
         if self.focus == "sections":
@@ -330,11 +342,12 @@ class App:
             self.task_idx = index
 
     def change_section(self, delta: int):
+        """セクションを移す。一覧の端まで来たら反対の端へ回る。"""
         sections = self.sections()
         if not sections:
             return
         self.filter = None
-        self.section_idx = max(0, min(self.section_idx + delta, len(sections) - 1))
+        self.section_idx = (self.section_idx + delta) % len(sections)
         self.task_idx = 0
         self.scroll = 0
 
@@ -344,11 +357,39 @@ class App:
         title = self.prompt("追加", "")
         if not title:
             return
-        task = ops.add(self.doc, title, self.ctx.base)
+        task = ops.add(self.doc, title, self.ctx.base, due=self.suggest_due())
         self.save()
         self.filter = None
         self.jump_to(task)
         self.notify("追加しました: %s (%s)" % (task.title, task.section))
+
+    def suggest_due(self):
+        """いま見ているセクションの期日を入れるか聞き、入れるなら日付を返す。
+
+        Today や Tomorrow を見ているときに作るタスクは、たいていその
+        タイミングでやりたいもの。しかし期日が無いタスクは配置ルールにより
+        ParkingLot へ置かれてしまい、作った直後に見失う。
+        期日で決まらないセクション（OpenEnded・ParkingLot）では聞かない。
+        """
+        if self.filter:
+            return None
+        section = self.current_section()
+        if section is None:
+            return None
+        due = schedule.section_due(section.name, self.ctx.base)
+        if due is None:
+            return None
+        if not self.ask("%s のタスクとして期日を %s（%s）にしますか？"
+                        % (section.name, util.format_date(due), self._day_note(due))):
+            return None
+        return due
+
+    def _day_note(self, day) -> str:
+        """期日を確認するときに添える、基準日から見た呼び名。"""
+        delta = (day - self.ctx.base).days
+        if 0 <= delta <= 2:
+            return ("本日", "明日", "明後日")[delta]
+        return "%s曜" % WEEKDAYS[day.weekday()]
 
     def add_child(self):
         """選択中のタスクの子として追加する（a はトップレベルに追加する）。"""
@@ -498,6 +539,33 @@ class App:
         self.filter = None
         self.jump_to(task)
         self.notify("%s へ移動しました。" % task.section)
+
+    def reorder(self, delta: int):
+        """選択中のタスクを兄弟の中で上下に動かす（m はセクション間の移動）。"""
+        if self.filter:
+            self.notify("検索結果では並べ替えできません。", "error")
+            return
+        task = self.current_task()
+        if task is None:
+            return
+        if not ops.reorder(self.doc, task, delta):
+            self.notify("%sこれ以上動かせません。"
+                        % ("同じ親の中で" if task.parent is not None else ""))
+            return
+        self.save()
+        self.jump_to(task)
+        self.notify("並べ替えました。")
+
+    def duplicate_task(self):
+        """タスク行だけを複製する。詳細文と子タスクは引き継がない。"""
+        task = self.current_task()
+        if task is None:
+            return
+        copy = ops.duplicate(self.doc, task)
+        self.save()
+        self.filter = None
+        self.jump_to(copy)
+        self.notify("複製しました（詳細文と子タスクは除く）。i でタイトルを直せます。")
 
     def start_search(self, kind: str):
         label = "検索" if kind == "keyword" else "タグ検索 #"
@@ -875,7 +943,7 @@ class App:
             index = self.scroll + i
             if not rows:
                 text = ("  該当なし  Esc で解除" if self.filter
-                        else "  タスクはありません  j/k または J/K でセクション移動")
+                        else "  タスクはありません  J/K または Tab でセクション移動")
                 self._draw_spans(y, x, [(text, "empty")] if i == 0 else [], right_w)
                 continue
             if index >= len(rows):
@@ -1078,7 +1146,6 @@ class App:
         """一覧から1つ選ぶモーダル。Esc で中断すると None を返す。"""
         index = 0
         while True:
-            height, _, _, _ = self.geometry()
             lines = []
             for i, option in enumerate(options):
                 mark, role = (marks[i] if marks else ("", "popup.text"))
@@ -1086,9 +1153,9 @@ class App:
                               (_cell(mark, 2) if mark else "", role),
                               (option, "popup.text")])
             # 画面が低いときは選択中の項目が箱に入るよう窓をずらす
-            visible = max(1, min(len(lines), height - 8))
+            visible = self._popup_rows(len(lines))
             offset = max(0, min(index - visible + 1, len(lines) - visible))
-            self._popup_draw(title, lines[offset:offset + visible], selected=index - offset,
+            self._popup_draw(title, lines, offset=offset, selected=index,
                              hint="j/k 移動   Enter 決定   Esc 中止")
             try:
                 key = self.screen.get_wch()
@@ -1106,22 +1173,25 @@ class App:
                 return int(key) - 1
 
     def popup(self, title: str, lines):
-        """読み取り専用のモーダル。上下でスクロールし、任意キーで閉じる。"""
+        """読み取り専用のモーダル。j/k でスクロールし、他のキーで閉じる。
+
+        j/k は端まで来ても閉じる操作にしない。詳細文を読み進めた勢いで
+        モーダルが消えてしまうため（popup_ask と同じ扱い）。
+        """
         offset = 0
         while True:
-            height, _, _, _ = self.geometry()
-            visible = max(1, height - 8)
+            visible = self._popup_rows(len(lines))
             more = len(lines) > visible
-            hint = "j/k スクロール   任意のキーで閉じる" if more else "任意のキーで閉じる"
-            self._popup_draw(title, lines[offset:offset + visible], hint=hint)
+            hint = "j/k スクロール   他のキーで閉じる" if more else "任意のキーで閉じる"
+            self._popup_draw(title, lines, offset=offset, hint=hint)
             try:
                 key = self.screen.get_wch()
             except curses.error:
                 continue
-            if key in (curses.KEY_DOWN, "j") and offset + visible < len(lines):
-                offset += 1
-            elif key in (curses.KEY_UP, "k") and offset > 0:
-                offset -= 1
+            if key in (curses.KEY_DOWN, "j"):
+                offset = min(offset + 1, max(0, len(lines) - visible))
+            elif key in (curses.KEY_UP, "k"):
+                offset = max(0, offset - 1)
             else:
                 return
 
@@ -1133,9 +1203,8 @@ class App:
         """
         offset = 0
         while True:
-            height, _, _, _ = self.geometry()
-            visible = max(1, height - 8)
-            self._popup_draw(title, lines[offset:offset + visible], hint=hint)
+            visible = self._popup_rows(len(lines))
+            self._popup_draw(title, lines, offset=offset, hint=hint)
             try:
                 key = self.screen.get_wch()
             except curses.error:
@@ -1149,8 +1218,21 @@ class App:
             else:
                 return False
 
-    def _popup_draw(self, title: str, lines, selected=None, hint: str | None = None):
-        """中央に枠付きの箱を描く。lines は文字列か span の並び。"""
+    def _popup_rows(self, count: int, hint: bool = True) -> int:
+        """モーダルの本文に入る行数（案内行を除く）。スクロール量の上限になる。"""
+        height, _, _, _ = self.geometry()
+        margin = 2 if hint else 0
+        box_height = min(height - 2, count + margin + 4)
+        return max(1, box_height - 4 - margin)
+
+    def _popup_draw(self, title: str, lines, offset: int = 0, selected=None,
+                    hint: str | None = None):
+        """中央に枠付きの箱を描く。lines は文字列か span の並び。
+
+        lines は全行を受け取り、offset から入るだけを描く。箱の幅は見えている
+        行ではなく全行から決める。スクロールのたびに箱の幅が変わると、
+        読んでいる文章が組み替わって見えるため。
+        """
         t = self.theme
         height, width, _, _ = self.geometry()
         rendered = [_as_spans(line) for line in lines]
@@ -1158,8 +1240,9 @@ class App:
         content_w = max(content_w, display_width(title) + 2,
                         display_width(hint or "") + 2)
         inner = max(24, min(width - 6, content_w + 2))
-        rows = len(rendered) + (2 if hint else 0)
-        box_height = min(height - 2, rows + 4)
+        margin = 2 if hint else 0
+        box_height = self._popup_rows(len(rendered), bool(hint)) + margin + 4
+        rendered = rendered[offset:]
         top = max(0, (height - box_height) // 2)
         left = max(0, (width - inner - 2) // 2)
         border = t.attr("popup.border")
@@ -1183,7 +1266,8 @@ class App:
                 spans = [("  " + hint, "popup.hint")]
             elif hint and i == body - 2:
                 spans = []
-            base = t.attr("cursor") if selected is not None and i == selected else None
+            base = (t.attr("cursor")
+                    if selected is not None and offset + i == selected else None)
             self._draw_spans(y, left + 1, spans, inner, base=base)
             self._addstr(y, left + 1 + inner, side, border)
         self._addstr(top + box_height - 1, left,
