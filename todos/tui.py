@@ -105,6 +105,18 @@ HELP_KEYS = [
     ("q", "終了"),
 ]
 
+#: 入力欄（追加・タイトル編集・期日・タグ・検索）で使えるキー。
+PROMPT_KEYS = [
+    ("← / →", "カーソルを左 / 右へ（Ctrl-b / Ctrl-f）"),
+    ("Home / End", "行頭 / 行末へ（Ctrl-a / Ctrl-e）"),
+    ("Backspace", "カーソルの手前を 1 文字消す"),
+    ("Delete", "カーソル位置を 1 文字消す（Ctrl-d）"),
+    ("Ctrl-w", "直前の語を消す"),
+    ("Ctrl-u", "カーソルより前を消す"),
+    ("Ctrl-k", "カーソルより後ろを消す"),
+    ("Enter / Esc", "確定 / 中止"),
+]
+
 
 def run(ctx) -> int:
     """TUI を起動する。ctx.doc は読み込み済みであること。"""
@@ -701,14 +713,24 @@ class App:
         self.notify("%d 件を修正しました。" % len(applied))
 
     def show_help(self):
+        lines = self._key_table(HELP_KEYS)
+        lines.append("")
+        lines.append([("  入力欄（追加・タイトル編集・期日・タグ・検索）",
+                       "popup.label")])
+        lines += self._key_table(PROMPT_KEYS)
+        self.popup("キー操作", lines)
+
+    def _key_table(self, keys):
+        """(キー, 説明) の並びをヘルプの行にする。キー欄は一覧の中で桁を揃える。"""
+        column = max(display_width(key) for key, _ in keys)
         lines = []
-        for key, desc in HELP_KEYS:
+        for key, desc in keys:
             if not key:
                 lines.append("")
                 continue
-            lines.append([("  ", None), (pad(key, 8), "hint.key"), ("  ", None),
-                          (desc, "popup.text")])
-        self.popup("キー操作", lines)
+            lines.append([("  ", None), (pad(key, column), "hint.key"),
+                          ("  ", None), (desc, "popup.text")])
+        return lines
 
     def show_detail(self):
         task = self.current_task()
@@ -1086,20 +1108,29 @@ class App:
     # ------------------------------------------------------------ 入力部品
 
     def prompt(self, label: str, initial: str = "") -> str | None:
-        """ステータスバーでの1行入力。Esc で中断すると None を返す。"""
+        """ステータスバーでの1行入力。Esc で中断すると None を返す。
+
+        カーソルを動かして途中を直せる（末尾から消し直さずに済むように）。
+        キーは PROMPT_KEYS のとおり。入力欄より長い文字列は横に送る。
+        """
         height, width, _, _ = self.geometry()
         buf = list(initial)
+        pos = len(buf)
+        view = 0  # 入力欄の左端に出す文字の位置（横スクロール）
         curses.curs_set(1)
         try:
             while True:
-                head = " %s " % label
-                spans = [(head, "bar.mode")]
+                spans = [(" %s " % label, "bar.mode")]
                 if self.theme.powerline:
                     spans.append((self.theme.separator(), "bar.sep.end"))
-                spans.append((" " + "".join(buf), "bar"))
+                # 入力欄は帯の右隣、先頭の空白 1 桁を空けた位置から始まる
+                field_x = _spans_width(spans) + 1
+                field_w = max(4, width - field_x)
+                view = _input_view(buf, pos, view, field_w)
+                spans.append((" " + "".join(buf[view:]), "bar"))
                 self._draw_spans(height - 1, 0, spans, width, fill_role="bar")
-                cursor = min(width - 1, _spans_width(spans[:-1]) + 1
-                             + display_width("".join(buf)))
+                cursor = min(width - 1,
+                             field_x + display_width("".join(buf[view:pos])))
                 try:
                     self.screen.move(height - 1, cursor)
                 except curses.error:
@@ -1113,14 +1144,50 @@ class App:
                     return "".join(buf).strip()
                 if key == "\x1b":
                     return None
-                if key in (curses.KEY_BACKSPACE, "\x7f", "\b"):
-                    if buf:
-                        buf.pop()
-                    continue
-                if isinstance(key, str) and key.isprintable():
-                    buf.append(key)
+                pos = self._edit(buf, pos, key)
         finally:
             curses.curs_set(0)
+
+    def _edit(self, buf: list, pos: int, key) -> int:
+        """入力欄のキーを 1 つ処理し、新しいカーソル位置を返す。
+
+        buf はその場で書き換える。知らないキーは無視する。
+        """
+        if key in (curses.KEY_LEFT, "\x02"):        # ← / Ctrl-b
+            return max(0, pos - 1)
+        if key in (curses.KEY_RIGHT, "\x06"):       # → / Ctrl-f
+            return min(len(buf), pos + 1)
+        if key in (curses.KEY_HOME, "\x01"):        # Home / Ctrl-a
+            return 0
+        if key in (curses.KEY_END, "\x05"):         # End / Ctrl-e
+            return len(buf)
+        if key in (curses.KEY_BACKSPACE, "\x7f", "\b"):
+            if pos:
+                del buf[pos - 1]
+                return pos - 1
+            return pos
+        if key in (curses.KEY_DC, "\x04"):          # Delete / Ctrl-d
+            if pos < len(buf):
+                del buf[pos]
+            return pos
+        if key == "\x15":                           # Ctrl-u: 手前を全部消す
+            del buf[:pos]
+            return 0
+        if key == "\x0b":                           # Ctrl-k: 後ろを全部消す
+            del buf[pos:]
+            return pos
+        if key == "\x17":                           # Ctrl-w: 直前の語を消す
+            start = pos
+            while start and buf[start - 1] == " ":
+                start -= 1
+            while start and buf[start - 1] != " ":
+                start -= 1
+            del buf[start:pos]
+            return start
+        if isinstance(key, str) and key.isprintable():
+            buf.insert(pos, key)
+            return pos + 1
+        return pos
 
     def ask(self, question: str) -> bool:
         """y/n の確認。TUI 未初期化の起動直後にも使えるようにしている。"""
@@ -1280,6 +1347,17 @@ class App:
 
 def _as_spans(line):
     return [(line, "popup.text")] if isinstance(line, str) else list(line)
+
+
+def _input_view(buf: list, pos: int, view: int, width: int) -> int:
+    """入力欄の左端に出す文字位置。カーソルが欄からはみ出さないようにずらす。"""
+    view = min(view, pos)
+    while view < pos and display_width("".join(buf[view:pos])) >= width:
+        view += 1
+    # 消して短くなったときは左へ戻す（末尾まで収まるなら全部見せる）
+    while view > 0 and display_width("".join(buf[view - 1:])) < width:
+        view -= 1
+    return view
 
 
 def _spans_width(spans) -> int:

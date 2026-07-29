@@ -4,6 +4,7 @@
 実行: python3 -m unittest discover -s tests
 """
 
+import curses
 import datetime as dt
 import io
 import os
@@ -1153,6 +1154,72 @@ class TuiEditTest(unittest.TestCase):
         app.popup_ask = lambda *a, **k: self.fail("直せない問題で確認を求めないこと")
         app.show_warnings()
         self.assertIn("警告", shown["title"])
+
+
+class TuiPromptTest(unittest.TestCase):
+    """入力欄の行編集。curses は起動せず、キー入力だけを流す。"""
+
+    def make_app(self, keys):
+        app = tui.App.__new__(tui.App)
+        app.theme = theme.Theme("mono").setup()
+        app.geometry = lambda: (24, 40, 10, 26)
+        it = iter(keys)
+        app.screen = type("S", (), {
+            "get_wch": staticmethod(lambda: next(it)),
+            "move": staticmethod(lambda y, x: None),
+            "refresh": staticmethod(lambda: None),
+        })()
+        app._draw_spans = lambda *a, **k: None
+        # curses を初期化していないので、カーソルの表示切り替えだけ黙らせる
+        original = tui.curses.curs_set
+        tui.curses.curs_set = lambda n: None
+        self.addCleanup(setattr, tui.curses, "curs_set", original)
+        return app
+
+    def type(self, initial, keys):
+        keys = list(keys) + ["\n"]
+        return self.make_app(keys).prompt("追加", initial)
+
+    def test_left_and_right_move_the_cursor(self):
+        # 「ABC」の B の前へ戻って X を入れる
+        keys = [curses.KEY_LEFT, curses.KEY_LEFT, "X", curses.KEY_RIGHT, "Y"]
+        self.assertEqual(self.type("ABC", keys), "AXBYC")
+
+    def test_backspace_deletes_before_the_cursor(self):
+        self.assertEqual(self.type("ABC", [curses.KEY_LEFT, "\x7f"]), "AC")
+
+    def test_delete_removes_the_character_under_the_cursor(self):
+        keys = [curses.KEY_HOME, curses.KEY_DC]
+        self.assertEqual(self.type("ABC", keys), "BC")
+
+    def test_home_and_end_jump_to_both_ends(self):
+        keys = [curses.KEY_HOME, "1", curses.KEY_END, "9"]
+        self.assertEqual(self.type("ABC", keys), "1ABC9")
+
+    def test_control_keys_cut_around_the_cursor(self):
+        self.assertEqual(self.type("ABCDE", [curses.KEY_LEFT, "\x15"]), "E")
+        self.assertEqual(self.type("ABCDE", [curses.KEY_LEFT, "\x0b"]), "ABCD")
+        self.assertEqual(self.type("会議の 準備 メモ", ["\x17"]), "会議の 準備")
+
+    def test_editing_works_on_full_width_text(self):
+        keys = [curses.KEY_LEFT, "の"]
+        self.assertEqual(self.type("会議準備", keys), "会議準の備")
+
+    def test_escape_cancels_even_after_editing(self):
+        app = self.make_app([curses.KEY_HOME, "X", "\x1b"])
+        self.assertIsNone(app.prompt("追加", "ABC"))
+
+    def test_unknown_keys_are_ignored(self):
+        self.assertEqual(self.type("ABC", [curses.KEY_F1, "D"]), "ABCD")
+
+    def test_view_follows_the_cursor_in_a_narrow_field(self):
+        buf = list("あいうえおかきくけこ")  # 表示幅 20
+        # 幅 10 の欄では左が隠れる。末尾のカーソルにも 1 桁要るので 4 文字分だけ残す
+        self.assertEqual(tui._input_view(buf, len(buf), 0, 10), 6)
+        # 行頭へ戻せば左端から見せる
+        self.assertEqual(tui._input_view(buf, 0, 5, 10), 0)
+        # 全部収まるなら送らない
+        self.assertEqual(tui._input_view(buf, len(buf), 3, 40), 0)
 
 
 class TuiNavigationTest(unittest.TestCase):
